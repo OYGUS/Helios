@@ -1,0 +1,27 @@
+# Local user data and session history (excluded from Git)
+data/
+projects/*
+!projects/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+local_config.json
+.env
+*.lnk
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+
+# IDE / OS settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
