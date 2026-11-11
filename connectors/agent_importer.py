@@ -1,24 +1,135 @@
-"""Scans local Antigravity, OpenAI Codex, and Claude Code session histories
-and converts them into Project Name and Architectural Layer graphs.
+"""Scans local Antigravity, OpenAI Codex, and Claude Code session histories.
 
-Core Principles:
-1. Every Project Core (Sun) clearly describes what the project does, its purpose, and its core architecture.
-2. Trivial/noisy messages ("run code", "start file", "continue", raw error dumps, token strings,
-   and internal system prompts) are filtered out.
-3. Modules and sub-components are created from meaningful architectural features, modules,
-   and technical decision headings rather than raw chat lines.
+Architecture cannot be derived from chat, so session logs are used for two things only:
+finding which project folders were worked on, and a per-project history of the sessions.
+
+* **The map comes from the real code.** For every project folder found in the logs that
+  exists on this machine and contains analysable source files, the modules, sub-components
+  and links are built with `connectors.codebase_importer.build_code_map()`, exactly as a
+  codebase scan would build them (a file that no session touched still appears).
+* **One "Work History" module** (`kind="history"`, layer `docs`) is added. Its
+  sub-components are sessions, most recent first (at most `HISTORY_SESSION_CAP`), titled
+  `YYYY-MM-DD — <files touched>` (date from log timestamps, else the log file's
+  modification time, UTC; label built from the files touched by tool calls, never from
+  chat text). The content names the tool and quotes the user's requests of that session
+  (at most `REQUESTS_PER_SESSION`, truncated), the files changed/read and the tools used.
+  Antigravity plan/design artifacts (`*.md` in the session folder) may be added as extra
+  sub-components titled by their H1 (at most `HISTORY_ARTIFACT_CAP`). Every tool's
+  sessions go into the same module; each sub-component's first line names its tool.
+* Chat headings, bold text and request sentences are never used as module or
+  sub-component titles.
+
+Project identity
+----------------
+* Codex (`session_meta.cwd`) and Claude Code (`cwd` on each entry) record the session's
+  working directory; Antigravity has no cwd, so the absolute paths seen in tool-call
+  arguments are used instead.
+* If the directory exists on this machine, the project root is found by walking up from
+  it to the nearest folder containing a root marker (`.git`, `package.json`,
+  `pyproject.toml`, `requirements.txt`, `Cargo.toml`, `go.mod`, `composer.json`,
+  `*.sln`, ...), never going to or above the home directory. Otherwise the cwd itself is
+  the root (Windows paths are handled as strings via `PureWindowsPath` on any OS).
+* For tool-call paths, the root is the nearest marker root of a path that exists locally,
+  else the deepest common ancestor of the touched paths (narrowed below generic
+  containers such as home or Desktop, trailing generic sub-folders trimmed).
+* Sessions without a resolvable workspace (home directory, Desktop, drive roots, agent
+  data folders, no paths at all) are skipped and counted in `LAST_SCAN_STATS`. Chat text
+  (e.g. a GitHub URL mentioned in conversation) is never used.
+* One project per folder across all sources: the normalised folder path is the identity.
+  An existing system for the folder under ANY non-manual source (codebase, another
+  tool) is updated in place: the tool is added to `sources`, `source` stays as it is.
+  Stale duplicates for the same folder left by older versions are consolidated
+  (`codebase_importer.consolidate_folder_systems`).
+
+Folders that do not become projects (counted per folder in `LAST_SCAN_STATS[source]`,
+with up to `STATS_PATH_CAP` paths under `<key>_paths`):
+
+* `skipped_missing_workspace` — the folder does not exist on this machine;
+* `skipped_no_code` — it exists but contains no analysable source files;
+* `skipped_scratch` — a tool-managed scratch workspace (e.g.
+  `Documents/Codex/<YYYY-MM-DD>/<name>`, or below a `scratchpad` / `scratch` folder)
+  without a project root marker DIRECTLY at its root. How much code it holds does not
+  matter: such folders often hold copies, clones and backups of other projects (with
+  `package.json` files only in nested sub-folders). A real project nested inside a
+  scratch dir (with its own marker, e.g. `.../outputs/regbot/package.json`) is found only
+  through the files a session actually touched inside it — the scratch dir itself is
+  never searched for markers.
+* `skipped_ignored` — the folder equals or is inside a folder of the store setting
+  `ignored_folders` (see `codebase_importer.is_ignored_folder`). An existing system for
+  it is left alone here (the UI removes it).
+
+For the first three reasons an existing agent-source system that has nothing user-made
+in it (`codebase_importer.has_user_made_content`; e.g. a module of an importer-only kind
+such as "External Libraries" flagged `is_user_modified` by the canvas auto-layout does
+not count) and was never a codebase scan is removed (`removed_stale`); a system with a
+user edit, a canvas note, a user-drawn link or a purpose typed by the user is left
+untouched.
+
+Purpose evidence: the session requests of a folder are used for one thing besides the
+Work History module: the first few real requests of its earliest sessions (noise
+filtered, quoted, truncated) become the FIRST line of `SolarSystem.purpose_evidence`,
+"From the first sessions (what the user asked for)". They never shape the map.
+
+Trivial/noisy requests ("continue", "devam et", raw error dumps, token strings, internal
+system prompts) are not quoted in the history.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
+import posixpath
 import re
 import shutil
-from collections import Counter
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from core.models import LAYER_DEFINITIONS, GalaxyStore, PlanetNode, SolarSystem
+from connectors.codebase_importer import (
+    AGENT_SOURCES,
+    HISTORY_PLANET_TITLE,
+    LAST_SCAN_STATS,
+    _keep_only_real_links,
+    _identity_keys,
+    add_source,
+    build_code_map,
+    compose_purpose_evidence,
+    consolidate_folder_systems,
+    find_systems_for_folder,
+    format_session_requests,
+    has_user_made_content,
+    history_note,
+    ignored_folder_keys,
+    is_ignored_folder,
+    merge_identity,
+    merge_purpose,
+    refresh_system_from_code,
+    update_core_plan_purpose,
+    workspace_key,
+)
+from core.models import LAYER_DEFINITIONS, SOURCE_CATEGORIES, GalaxyStore, PlanetNode, SatelliteNode, SolarSystem
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Limits
+# ---------------------------------------------------------------------------
+MAX_JSONL_LINES = 20_000  # lines read per session transcript
+MAX_JSONL_BYTES = 64 * 1024 * 1024  # bytes read per session transcript
+HISTORY_SESSION_CAP = 8  # sessions shown in the Work History module (all tools together)
+HISTORY_ARTIFACT_CAP = 4  # plan/design artifacts shown in the Work History module
+REQUESTS_PER_SESSION = 6  # user requests quoted per session
+REQUEST_CHAR_LIMIT = 160  # characters per quoted request
+STATS_PATH_CAP = 20  # folder paths listed per skip reason in LAST_SCAN_STATS
+DETECTOR_WALK_CAP = 20_000  # directory entries visited when counting Codex sessions
+
+#: Statistics of the most recent scan per source (the same dict object as
+#: `codebase_importer.LAST_SCAN_STATS`), e.g.
+#: LAST_SCAN_STATS["codex"] == {"sessions_found": 10, "skipped_scratch": 1,
+#:                              "skipped_scratch_paths": ["C:\\...\\tablo"], ...}
 
 
 def _tr_lower(text: str) -> str:
@@ -26,783 +137,811 @@ def _tr_lower(text: str) -> str:
     return text.replace("İ", "i").replace("I", "i").lower()
 
 
-GENERIC_FOLDER_NAMES = {
-    _tr_lower(Path.home().name),
-    "users",
-    "user",
-    "desktop",
-    "documents",
-    "downloads",
-    "projects",
-    "source",
-    "repos",
-    "codex",
-    "antigravity",
-    "chatgpt",
-    "claude",
-    "brain",
-    "scratch",
-    "logs",
-    "sessions",
-    "archived_sessions",
-    "system_generated",
-    ".gemini",
-    ".codex",
-    ".claude",
-    "c:",
-    "d:",
-    "xampp",
-    "htdocs",
-    "php",
-    "node",
-    "node.exe",
-    "python",
-    "python.exe",
-    "scripts",
-    "bin",
-    "obj",
-    "src",
-    "dist",
-    "build",
-    "venv",
-    ".venv",
-    "appdata",
-    "local",
-    "roaming",
-    "temp",
-    "tmp",
-    "cache",
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class Exchange:
+    user: str
+    ai: str = ""
+    tools: List[str] = field(default_factory=list)
+    files: List[Tuple[str, bool]] = field(default_factory=list)  # (path, edited)
+
+    @property
+    def used_tools(self) -> bool:
+        return bool(self.tools)
+
+    @property
+    def edited_files(self) -> List[str]:
+        return [p for p, e in self.files if e]
+
+
+@dataclass
+class SessionData:
+    session_id: str
+    cwd: str = ""
+    exchanges: List[Exchange] = field(default_factory=list)
+    artifacts: List[Path] = field(default_factory=list)
+    tool_paths: List[str] = field(default_factory=list)
+    mtime: float = 0.0
+    title: str = ""
+    log_path: str = ""
+    last_ts: str = ""  # latest ISO timestamp seen in the log ("" if none)
+
+    def note_timestamp(self, value: object) -> None:
+        s = str(value or "")
+        if re.match(r"^\d{4}-\d{2}-\d{2}", s) and s > self.last_ts:
+            self.last_ts = s
+
+
+def _note_entry_time(data: SessionData, obj: dict) -> None:
+    for key in ("timestamp", "created_at", "createdAt", "time"):
+        if key in obj:
+            data.note_timestamp(obj.get(key))
+    payload = obj.get("payload")
+    if isinstance(payload, dict) and "timestamp" in payload:
+        data.note_timestamp(payload.get("timestamp"))
+
+
+# ---------------------------------------------------------------------------
+# Path helpers (Windows paths are handled as strings on any OS)
+# ---------------------------------------------------------------------------
+_WIN_ABS_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\)")
+_WIN_PATH_IN_TEXT = re.compile(r"(?<![\w])[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n\s']+\\)*[^\\/:*?\"<>|\r\n\s']*")
+_WIN_QUOTED_PATH = re.compile(r"[\"']([A-Za-z]:\\[^\"'\r\n]+)[\"']")
+_POSIX_PATH_IN_TEXT = re.compile(r"(?<![\w.~:/])/(?:[\w.\-@+]+/)+[\w.\-@+]*")
+
+ROOT_MARKERS: Tuple[str, ...] = (
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "Cargo.toml",
+    "go.mod",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "deno.json",
+    "CMakeLists.txt",
+    "pubspec.yaml",
+)
+_ROOT_MARKER_GLOBS: Tuple[str, ...] = ("*.sln", "*.csproj")
+_ROOT_MARKER_NAMES_LOWER = {m.lower() for m in ROOT_MARKERS}
+
+#: Folder names that hold projects rather than being one.
+CONTAINER_FOLDER_NAMES = {
+    "users", "home", "desktop", "documents", "downloads", "projects", "repos", "repositories",
+    "source", "sources", "code", "dev", "development", "workspace", "workspaces", "github",
+    "git", "tmp", "temp", "htdocs", "www", "xampp", "sites", "onedrive", "codex", "volumes",
+    "mnt", "media", "root", "private", "var", "chatgpt", "scratch",
+}
+_DATE_OR_UUID_RE = re.compile(r"^(?:\d{4}-\d{2}(?:-\d{2})?|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+#: Path segments that mark agent data / system locations (never a project).
+_EXCLUDED_SEGMENTS = {".codex", ".claude", ".gemini", "appdata", "system32", "program files", "program files (x86)", "site-packages", "node_modules"}
+#: Generic project folder names that get the parent folder name as a prefix.
+GENERIC_PROJECT_NAMES = {
+    "src", "app", "apps", "backend", "frontend", "server", "client", "web", "api", "code",
+    "source", "project", "main", "www", "public_html", "site", "website", "lib", "core",
+    "service", "services", "repo",
+}
+#: Trailing sub-folders trimmed from a derived (non-local) common ancestor.
+_TRIM_SUBFOLDERS = {
+    "src", "lib", "css", "js", "styles", "components", "pages", "scripts", "static", "assets",
+    "public", "tests", "test", "utils", "helpers", "img", "images", "api", "ui", "core", "models",
+    "views", "routes", "controllers", "services", "templates", "docs", "config", "handlers",
 }
 
 
-# Curated architectural blueprint for Helios itself
-PROJECT_BLUEPRINTS: Dict[str, Dict[str, object]] = {
-    "Helios": {
-        "purpose": (
-            "Interactive desktop architecture mapping application that transforms AI project planning, "
-            "coding agent session histories, and local codebases into a layered knowledge graph "
-            "with a central Core Plan, Architectural Modules, Sub-Components, and source-grouped project regions."
-        ),
-        "stack": "Python 3 • PySide6 (QGraphicsScene/QGraphicsView) • AST Code Analysis • Live CLI/Skill Bridge",
-        "highlights": (
-            "• Central Project Overview & Core Plan pinned in the right inspector panel\n"
-            "• Dedicated regions for Antigravity, OpenAI Codex, Claude Code, and Codebase projects\n"
-            "• Directed Dependency Links, Fuzzy Search, and Guided Architecture Tour"
-        ),
-        "curated_planets": {
-            "antigravity": [
-                (
-                    "Architecture & Concept Design",
-                    "architecture",
-                    (
-                        "MODULE PURPOSE & ROLE:\n"
-                        "Three-tier hierarchical knowledge graph architecture designed to keep a project's "
-                        "primary objective and architectural rules visible across long AI coding sessions.\n\n"
-                        "HOW IT WORKS & TECHNICAL FLOW:\n"
-                        "• The 'Project Core (Sun)' sits at the center holding the project purpose and rules.\n"
-                        "• Architectural layers (UI, Core, Integration, Security/Testing) orbit the center as module nodes.\n"
-                        "• Concrete source files and features appear along each module's outer arc as sub-components.\n"
-                        "• All data is persisted to `data/galaxy.json` via `GalaxyStore` in `core/models.py`."
-                    ),
-                    [
-                        (
-                            "Core Plan, Module & Component Hierarchy",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Separates project knowledge into 3 levels (Project Core → Architectural Module → Sub-Component) "
-                                "so complex systems can be understood at a glance.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `SolarSystem` stores the project identity, workspace path, and `core_plan`.\n"
-                                "• `PlanetNode` represents architectural layers (`architecture`, `ui`, `core`, `integration`, `testing`) arranged automatically via `rebalance_layout()`.\n"
-                                "• `SatelliteNode` holds concrete source files, functions, and technical decisions under each layer.\n\n"
-                                "RELATED FILE: `core/models.py`"
-                            ),
-                            "diagram",
-                        ),
-                        (
-                            "Source-Based Region Grouping",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Groups projects developed across different AI tools (Antigravity, OpenAI Codex, Claude Code) "
-                                "and local codebases under their own application headers without mixing them.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `SOURCE_CATEGORIES` defines the title, accent color, and display order for each source.\n"
-                                "• In All Projects view, `recalculate_galaxy_sectors()` arranges each source's projects into non-overlapping dashboard grids.\n"
-                                "• Counterparts of the same project across sources are linked via `find_related_systems()`.\n\n"
-                                "RELATED FILE: `core/models.py`, `ui/space_canvas.py`"
-                            ),
-                            "idea",
-                        ),
-                    ],
-                ),
-                (
-                    "Interactive Canvas & UI",
-                    "ui",
-                    (
-                        "MODULE PURPOSE & ROLE:\n"
-                        "PySide6 desktop interface layer where users inspect projects and architectural layers, "
-                        "zoom and pan, and drag-and-drop nodes.\n\n"
-                        "HOW IT WORKS & TECHNICAL FLOW:\n"
-                        "• Custom graphics items (`SunGraphicsItem`, `PlanetGraphicsItem`, `SatelliteGraphicsItem`, `GalaxyClusterItem`) render on `SpaceCanvasView` (`QGraphicsView` / `QGraphicsScene`).\n"
-                        "• Features a source-grouped project tree on the left, an interactive canvas with breadcrumb navigation in the center, and a pinned Project Core card + detail editor on the right.\n"
-                        "• Supports drag-and-drop positioning, context menus, fuzzy search, and a step-by-step Architecture Tour."
-                    ),
-                    [
-                        (
-                            "Interactive Architecture Canvas (space_canvas.py)",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Graphics engine that renders projects both as summary cards in the 'All Projects' dashboard "
-                                "and as core-module-component diagrams in 'Project View'.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `GalaxyClusterItem`: Rich project card in All Projects view showing the project name, purpose, layer tags, and component counts.\n"
-                                "• `PlanetGraphicsItem` & `SatelliteGraphicsItem`: Draggable via `mouseMoveEvent` with automatic persistence.\n"
-                                "• `ConstellationLinkItem`: Renders curved directed arrows indicating data flow and dependency direction.\n\n"
-                                "RELATED FILE: `ui/space_canvas.py`"
-                            ),
-                            "code",
-                        ),
-                        (
-                            "Guided Architecture Tour & Fuzzy Search",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Step-by-step 'Architecture Tour' showing which layer to explore first, paired with "
-                                "instant search filtering that highlights matching nodes.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `start_or_advance_tour()`: Steps through Core Plan → Architecture → Core → Integration → UI → Testing and centers the camera on each module.\n"
-                                "• `set_search_query()`: Searches all module and sub-component contents from the top bar, dimming non-matching nodes (`is_dimmed`).\n\n"
-                                "RELATED FILE: `ui/space_canvas.py`, `ui/main_window.py`"
-                            ),
-                            "diagram",
-                        ),
-                    ],
-                ),
-                (
-                    "AI Agent & Codebase Bridges",
-                    "integration",
-                    (
-                        "MODULE PURPOSE & ROLE:\n"
-                        "Data integration layer connecting local AI agent session logs (Antigravity, OpenAI Codex, Claude Code), "
-                        "local project folders, and local Ollama LLM models to Helios.\n\n"
-                        "HOW IT WORKS & TECHNICAL FLOW:\n"
-                        "• `AgentHistoryImporter` scans agent logs, filters out noisy/trivial exchanges, and merges sessions belonging to the same project.\n"
-                        "• `CodebaseImporter` analyzes any project folder using Python AST and structural regex to build file/class/function architecture maps.\n"
-                        "• `OllamaEnhancer` optionally uses a local Ollama model to verify and enrich project summaries."
-                    ),
-                    [
-                        (
-                            "Agent History Scanner (agent_importer.py)",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Scans Antigravity (`~/.gemini/antigravity/brain`), OpenAI Codex (`~/.codex/sessions`), and Claude Code "
-                                "histories to produce noise-free project maps.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `_is_noise_or_trivial_message()` filters out operational commands, raw stack traces, and internal system logs.\n"
-                                "• `_infer_project_name()` and `_inspect_workspace_folder()` inspect real workspace files (`package.json`, `requirements.txt`, `README.md`) to infer the project purpose.\n"
-                                "• `_merge_or_populate_system()` preserves user modifications (`is_user_modified`) during resyncs.\n\n"
-                                "RELATED FILE: `connectors/agent_importer.py`"
-                            ),
-                            "code",
-                        ),
-                        (
-                            "AST Code & .ua Analyzer (codebase_importer.py)",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Automatically converts any local code directory or Understand-Anything (`.ua`) knowledge graph "
-                                "into architectural layers and file components.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• Scans `.py`, `.ts`, `.tsx`, `.js`, `.go`, `.rs`, `.cs`, and `.md` files and classifies them into layers via `_classify_file_layer()`.\n"
-                                "• Parses Python files with the `ast` module to extract module docstrings, classes, methods, function signatures, and cross-layer `import` dependencies.\n\n"
-                                "RELATED FILE: `connectors/codebase_importer.py`"
-                            ),
-                            "code",
-                        ),
-                        (
-                            "Ollama Verification & Live CLI Bridge",
-                            (
-                                "WHAT IT DOES:\n"
-                                "Verifies project summaries with a local Ollama model and allows external AI agents "
-                                "to update the Helios map live while working.\n\n"
-                                "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                                "• `connectors/ollama_enhancer.py`: Starts the local Ollama service in the background if needed and refines the core summary.\n"
-                                "• `connectors/live_bridge.py`: Updates `galaxy.json` live from the CLI; the UI watches the file via `QFileSystemWatcher` and refreshes immediately.\n\n"
-                                "RELATED FILE: `connectors/ollama_enhancer.py`, `connectors/live_bridge.py`"
-                            ),
-                            "code",
-                        ),
-                    ],
-                ),
-            ]
-        },
-    },
-}
+def _clean_path_str(raw: str) -> str:
+    p = str(raw or "").strip().strip("\"'").strip()
+    if p.lower().startswith("file://"):
+        from urllib.parse import unquote
+
+        p = unquote(p[7:])
+        if re.match(r"^/[A-Za-z]:[\\/]", p):
+            p = p[1:]
+    if len(p) > 3 and p.endswith(("\\", "/")):
+        p = p.rstrip("\\/")
+    return p
 
 
+def _is_windows_path(p: str) -> bool:
+    return bool(_WIN_ABS_RE.match(p))
+
+
+def _is_absolute(p: str) -> bool:
+    return _is_windows_path(p) or p.startswith("/")
+
+
+def _pure(p: str):
+    return PureWindowsPath(p) if _is_windows_path(p) else PurePosixPath(p)
+
+
+def _parts_lower(p: str) -> Tuple[str, ...]:
+    pure = _pure(p)
+    parts = pure.parts
+    if _is_windows_path(p):
+        return tuple(_tr_lower(x) for x in parts)
+    return tuple(parts)
+
+
+def _path_key(p: str) -> str:
+    """Normalised identity key for a folder path (case-insensitive for Windows paths)."""
+    return workspace_key(_clean_path_str(p))
+
+
+def _exists_locally(p: str) -> bool:
+    if not p or (_is_windows_path(p) and os.name != "nt"):
+        return False
+    try:
+        return Path(p).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _local_home_keys() -> Set[str]:
+    try:
+        home = Path.home()
+    except Exception:
+        return set()
+    return {_path_key(str(home)), _path_key(str(home.parent))}
+
+
+def _is_container_path(p: str) -> bool:
+    """True for folders that are not a project: drive/filesystem roots, home folders,
+    generic containers (Desktop, Documents, ...) and agent/system data locations."""
+    p = _clean_path_str(p)
+    if not p or not _is_absolute(p):
+        return True
+    parts = _parts_lower(p)
+    if len(parts) <= 1:
+        return True
+    low_parts = tuple(_tr_lower(x) for x in parts)
+    if any(seg in _EXCLUDED_SEGMENTS for seg in low_parts):
+        return True
+    last = low_parts[-1]
+    if last in CONTAINER_FOLDER_NAMES or last.startswith("onedrive"):
+        return True
+    if _DATE_OR_UUID_RE.match(last):
+        return True  # dated scratch folders (e.g. Documents\Codex\2025-01-31) and session ids
+    if _is_windows_path(p):
+        if len(parts) == 3 and parts[1] == "users":
+            return True
+        if parts[1] == "windows":
+            return True
+    else:
+        if len(parts) == 3 and parts[1] in ("home", "Users"):
+            return True
+        if len(parts) == 2 and parts[1] == "root":
+            return True
+    if _path_key(p) in _local_home_keys():
+        return True
+    return False
+
+
+def _has_root_marker(d: Path) -> bool:
+    for m in ROOT_MARKERS:
+        if (d / m).exists():
+            return True
+    for pattern in _ROOT_MARKER_GLOBS:
+        try:
+            if next(d.glob(pattern), None) is not None:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _find_marker_root(start: Path) -> Optional[Path]:
+    """Walks up from `start` to the nearest folder with a root marker, stopping before
+    the home directory and the filesystem root."""
+    try:
+        cur = start if start.is_dir() else start.parent
+    except OSError:
+        return None
+    try:
+        home = Path.home().resolve()
+    except Exception:
+        home = None
+    stop = {home, home.parent} if home else set()
+    for _ in range(40):
+        if cur in stop or cur == cur.parent:
+            return None
+        if _has_root_marker(cur):
+            return cur
+        cur = cur.parent
+    return None
+
+
+def _looks_like_file(p: str) -> bool:
+    name = _pure(p).name
+    return bool(name) and "." in name.strip(".")
+
+
+def _dir_of(p: str) -> str:
+    if _exists_locally(p):
+        try:
+            return p if Path(p).is_dir() else str(Path(p).parent)
+        except OSError:
+            return p
+    return str(_pure(p).parent) if _looks_like_file(p) else p
+
+
+def _relative_to_root(path: str, root: str) -> Optional[str]:
+    """POSIX-style path of `path` relative to `root`, or None if outside it."""
+    path = _clean_path_str(path)
+    if not path or not root:
+        return None
+    if not _is_absolute(path):
+        rel = path.replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if not rel or rel.startswith("../") or rel == "..":
+            return None
+        return rel
+    if _is_windows_path(path) != _is_windows_path(root):
+        return None
+    pp, rp = _parts_lower(path), _parts_lower(root)
+    if len(pp) <= len(rp) or pp[: len(rp)] != rp:
+        return None
+    original = _pure(path).parts
+    return "/".join(original[len(rp) :])
+
+
+def _join_path(base: str, rel: str) -> str:
+    rel = rel.strip()
+    if not rel or _is_absolute(rel) or not base:
+        return rel
+    if _is_windows_path(base):
+        return str(PureWindowsPath(base) / PureWindowsPath(rel))
+    return posixpath.normpath(posixpath.join(base, rel))
+
+
+def _extract_paths_from_text(text: str) -> List[str]:
+    found: List[str] = []
+    for m in _WIN_QUOTED_PATH.finditer(text):
+        found.append(m.group(1))
+    for m in _WIN_PATH_IN_TEXT.finditer(text):
+        found.append(m.group(0))
+    for m in _POSIX_PATH_IN_TEXT.finditer(text):
+        if m.group(0).count("/") >= 2:
+            found.append(m.group(0))
+    return list(dict.fromkeys(_clean_path_str(f) for f in found if f))
+
+
+def _display_name(root: str) -> str:
+    pure = _pure(root)
+    name = pure.name or str(pure)
+    parent = pure.parent.name
+    if _tr_lower(name) in GENERIC_PROJECT_NAMES and parent and _tr_lower(parent) not in CONTAINER_FOLDER_NAMES:
+        return f"{parent}-{name}"
+    return name
+
+
+def _deepest_common_ancestor(paths: List[str]) -> Optional[str]:
+    if not paths:
+        return None
+    lowered = [_parts_lower(p) for p in paths]
+    first = _pure(paths[0]).parts
+    common = 0
+    for i in range(min(len(x) for x in lowered)):
+        if all(x[i] == lowered[0][i] for x in lowered):
+            common = i + 1
+        else:
+            break
+    if common == 0:
+        return None
+    flavour = PureWindowsPath if _is_windows_path(paths[0]) else PurePosixPath
+    return str(flavour(*first[:common]))
+
+
+def _root_from_tool_paths(paths: Iterable[str]) -> Optional[Tuple[str, bool]]:
+    """Derives a project root from absolute tool-call paths. Returns (root, confirmed)."""
+    abs_paths = []
+    for raw in paths:
+        p = _clean_path_str(raw)
+        if not p or not _is_absolute(p):
+            continue
+        if any(_tr_lower(seg) in _EXCLUDED_SEGMENTS for seg in _parts_lower(p)):
+            continue
+        abs_paths.append(p)
+    if not abs_paths:
+        return None
+
+    # 1. Paths existing on this machine: nearest marker root, most frequent wins.
+    local_roots: Counter = Counter()
+    for p in abs_paths:
+        if _exists_locally(p):
+            mr = _find_marker_root(Path(p))
+            if mr is not None and not _is_container_path(str(mr)):
+                local_roots[str(mr)] += 1
+    if local_roots:
+        return local_roots.most_common(1)[0][0], True
+
+    # 2. Explicit marker files among the touched paths.
+    marker_roots: Counter = Counter()
+    for p in abs_paths:
+        if _tr_lower(_pure(p).name) in _ROOT_MARKER_NAMES_LOWER or _pure(p).suffix.lower() in (".sln", ".csproj"):
+            parent = str(_pure(p).parent)
+            if not _is_container_path(parent):
+                marker_roots[parent] += 1
+    if marker_roots:
+        return marker_roots.most_common(1)[0][0], False
+
+    # 3. Deepest common ancestor, narrowing to the largest cluster below containers.
+    win = [p for p in abs_paths if _is_windows_path(p)]
+    posix = [p for p in abs_paths if not _is_windows_path(p)]
+    group = [_dir_of(p) for p in (win if len(win) >= len(posix) else posix)]
+    for _ in range(6):
+        dca = _deepest_common_ancestor(group)
+        if dca is None:
+            return None
+        if not _is_container_path(dca):
+            cur = dca
+            while _tr_lower(_pure(cur).name) in _TRIM_SUBFOLDERS and not _is_container_path(str(_pure(cur).parent)):
+                cur = str(_pure(cur).parent)
+            return cur, False
+        depth = len(_parts_lower(dca))
+        nxt = Counter(_parts_lower(d)[depth] for d in group if len(_parts_lower(d)) > depth)
+        if not nxt:
+            return None
+        seg = nxt.most_common(1)[0][0]
+        group = [d for d in group if len(_parts_lower(d)) > depth and _parts_lower(d)[depth] == seg]
+    return None
+
+
+def _root_from_cwd(cwd: str) -> Optional[Tuple[str, bool]]:
+    cwd = _clean_path_str(cwd)
+    if not cwd or not _is_absolute(cwd):
+        return None
+    if _exists_locally(cwd):
+        p = Path(cwd)
+        mr = _find_marker_root(p)
+        root = mr if mr is not None else (p if p.is_dir() else p.parent)
+        root_s = str(root)
+        if _is_container_path(root_s):
+            return None
+        return root_s, True
+    if _is_container_path(cwd):
+        return None
+    return cwd, False
+
+
+def _resolve_project_root(cwd: str, tool_paths: Iterable[str] = ()) -> Optional[Tuple[str, str, str, bool]]:
+    """Returns (root key, root path, display name, confirmed) or None if unresolvable."""
+    res = _root_from_cwd(cwd) if cwd else None
+    if res is None:
+        res = _root_from_tool_paths(tool_paths)
+    if res is None:
+        return None
+    root, confirmed = res
+    if _is_container_path(root):
+        return None
+    return _path_key(root), root, _display_name(root), confirmed
+
+
+# ---------------------------------------------------------------------------
+# Message cleaning / noise filtering
+# ---------------------------------------------------------------------------
 def _clean_user_request(raw_text: str) -> str:
     """Extracts the clean user message inside <USER_REQUEST> tags and strips system blocks."""
     match = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", raw_text, re.DOTALL)
     if match:
         return match.group(1).strip()
 
-    cleaned = re.sub(r"<environment_context>.*?</environment_context>", "", raw_text, flags=re.DOTALL)
-    cleaned = re.sub(r"<permissions[^>]*>.*?</permissions>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<app-context>.*?</app-context>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<collaboration_mode>.*?</collaboration_mode>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<turn_aborted>.*?</turn_aborted>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<in-app-browser-context[^>]*>.*?</in-app-browser-context>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<in-app-browser-context[^>]*>", "", cleaned)
-    cleaned = re.sub(r"<send_user_message_question_reply>.*?</send_user_message_question_reply>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<send_user_message_question_reply>", "", cleaned)
+    cleaned = raw_text
+    for tag in (
+        "environment_context",
+        "permissions[^>]*",
+        "app-context",
+        "collaboration_mode",
+        "turn_aborted",
+        "in-app-browser-context[^>]*",
+        "send_user_message_question_reply",
+        "system-reminder",
+        "user_instructions",
+    ):
+        name = tag.split("[")[0]
+        cleaned = re.sub(rf"<{tag}>.*?</{name}>", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(rf"<{tag}>", "", cleaned)
     return cleaned.strip()
 
 
-def _is_noise_or_trivial_message(user_msg: str, ai_msg: str = "") -> bool:
-    """Filters out empty messages, trivial operational commands, stack traces, and tokens."""
+_CONTINUE_RE = re.compile(
+    r"^(?:run(?:\s+the)?\s+code|start\s+(?:the\s+)?(?:app|server)|continue|go\s+ahead|go\s+on|fix\s+it|looks\s+good|ok(?:ay)?|"
+    r"yes|no|thanks?|thank\s+you|done|devam(?:\s+et)?|tamam|evet|hay[ıi]r|olur|te[şs]ekk[üu]rler|sa[ğg]\s*ol|[çc]al[ıi][şs]t[ıi]r|d[üu]zelt)$"
+)
+_NOISE_PHRASES = (
+    "the following is the codex agent history",
+    "treat the transcript, tool call arguments",
+    ">>> transcript start",
+    "<in-app-browser-context",
+    "<send_user_message_question_reply",
+    "# files pasted by the user",
+    "# agents.md instructions",
+    "windows powershell",
+    "copyright (c) microsoft",
+    "traceback (most recent call last)",
+    "fatal error:",
+    "parse error:",
+    "warning: include(",
+    "warning: require_once(",
+    "warning: undefined array key",
+    "[warning: undefined",
+    "maxlistenersexceededwarning",
+    "contentscript.js:",
+    "secure ssl/tls settings",
+    "@[c:\\users",
+    "my request:",
+    "caveat: the messages below were generated",
+    "[request interrupted by user",
+)
+
+
+def _is_noise_or_trivial_message(user_msg: str, ai_msg: str = "", used_tools: bool = False) -> bool:
+    """Filters out empty messages, trivial operational commands, stack traces, and tokens.
+
+    Words are counted Unicode-aware. A short request ("add dark mode") is noise only if
+    no tools were used AND the reply is short."""
     u = user_msg.strip()
     if not u:
         return True
-
     low = _tr_lower(u)
-
-    if any(
-        noise in low
-        for noise in (
-            "the following is the codex agent history",
-            "treat the transcript, tool call arguments",
-            ">>> transcript start",
-            "<in-app-browser-context",
-            "<send_user_message_question_reply",
-            "# files pasted by the user",
-            "windows powershell",
-            "copyright (c) microsoft",
-            "traceback (most recent call last)",
-            "fatal error:",
-            "parse error:",
-            "warning: include(",
-            "warning: require_once(",
-            "warning: undefined array key",
-            "[warning: undefined",
-            "maxlistenersexceededwarning",
-            "contentscript.js:",
-            "secure ssl/tls settings",
-            "@[c:\\users",
-            "my request:",
-        )
-    ):
+    if any(noise in low for noise in _NOISE_PHRASES):
         return True
-
     if re.search(r"[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,}", u):
         return True
-
-    words = re.findall(r"[a-z0-9]+", low)
+    if _CONTINUE_RE.match(re.sub(r"[\s.!?,…]+$", "", low).strip()):
+        return True
+    words = re.findall(r"\w+", low)
     if len(words) <= 3 and len(u) < 32:
-        return True
-
-    if re.match(
-        r"^(?:run\s+code|start\s+app|start\s+server|continue|go\s+ahead|fix\s+it|looks\s+good)",
-        low,
-    ):
-        return True
-
+        if not used_tools and len(ai_msg.strip()) < 400:
+            return True
     return False
 
 
-def _extract_clean_feature_title(user_msg: str, ai_msg: str) -> Optional[str]:
-    """Extracts a clean sub-component title from meaningful architectural headings in the AI response."""
-    skip_headings = {
-        "summary",
-        "conclusion",
-        "question",
-        "hello",
-        "step by step",
-        "what changed",
-        "what was added",
-        "installation",
-        "current features",
-        "pros (+)",
-        "cons (-)",
-        "overview",
-        "test checklist",
-    }
-
-    if ai_msg:
-        headings = re.findall(r"^#{1,3}\s+([^\n#]+)$", ai_msg, flags=re.MULTILINE)
-        for h in headings:
-            clean_h = re.sub(r"[*_`~]+", "", h).strip(" :-–—•")
-            clean_h = re.sub(r"^\d+[\.\)]\s*", "", clean_h).strip()
-            low_h = _tr_lower(clean_h)
-            if 8 <= len(clean_h) <= 44 and not any(s in low_h for s in skip_headings):
-                return clean_h
-
-        bolds = re.findall(r"(?:^|\n)\s*(?:[-•*]|\d+\.)\s*\*\*([^*\n]{8,42})\*\*", ai_msg)
-        for b in bolds:
-            clean_b = b.strip(" :-–—")
-            low_b = _tr_lower(clean_b)
-            if 8 <= len(clean_b) <= 42 and not any(
-                low_b.startswith(p) for p in ("yes", "no", "note", "warning", "great", "sure")
-            ) and not any(s in low_b for s in skip_headings):
-                return clean_b
-
-    return None
+# ---------------------------------------------------------------------------
+# Scratch workspaces
+# ---------------------------------------------------------------------------
+#: A date / UUID folder directly below one of these is a tool-managed scratch dir
+#: (e.g. `Documents\Codex\2026-09-22\tablo`).
+SCRATCH_TOOL_DIR_NAMES = {"codex", "chatgpt", "claude", "claude code", "antigravity", "gemini", "cursor", "windsurf"}
+#: Any folder below one of these is a scratch workspace.
+SCRATCH_SEGMENT_NAMES = {"scratchpad", "scratch"}
 
 
-def _normalize_project_folder_name(raw_folder: str, context_text: str = "") -> Optional[str]:
-    """Normalizes a folder name into a clean project name."""
-    cleaned = raw_folder.strip().strip("\\/\"'.,;:)(")
-    if not cleaned or len(cleaned) <= 1:
-        return None
-    if not re.match(r"^[A-Za-z0-9_.\-]{2,36}$", cleaned):
-        return None
-    low = _tr_lower(cleaned)
-    if low in GENERIC_FOLDER_NAMES or low.startswith((".", "-")):
-        return None
-    if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-", low):
-        return None
-    if re.match(r"^\d{4}(-\d{2})?(-\d{2})?$", low):
-        return None
-    if re.search(r"\.(py|md|txt|json|jsonl|bat|ps1|sh|lnk|png|ico|jpg|zip|rar|sqlite|db|html|css|js|ts|exe)$", low):
-        return None
-
-    if "helios" in low:
-        return "Helios"
-
-    return cleaned
+def _is_scratch_path(p: str) -> bool:
+    parts = [_tr_lower(x) for x in _pure(_clean_path_str(p)).parts]
+    for i, seg in enumerate(parts):
+        if i < len(parts) - 1 and seg in SCRATCH_SEGMENT_NAMES:
+            return True
+        if i > 0 and _DATE_OR_UUID_RE.match(seg) and parts[i - 1] in SCRATCH_TOOL_DIR_NAMES:
+            return True
+    return False
 
 
-def _infer_project_name(
-    paths: List[str],
-    exchanges: List[Tuple[str, str, List[str]]],
-    fallback_hint: str = "",
-) -> Tuple[str, str]:
-    """Infers the real project name and workspace path from file paths and session content."""
-    all_text = " ".join(u + " " + a for u, a, _ in exchanges[:8]) + " " + fallback_hint
-    folder_counter: Counter[str] = Counter()
-    best_workspace_path = ""
-
-    patterns = [
-        r"[A-Za-z]:\\Users\\[^\\]+\\(?:Desktop|Documents|Projects|source|repos)(?:\\Codex\\\d{4}-\d{2}-\d{2})?(?:\\ChatGPT)?\\([A-Za-z0-9_.\-]+)",
-        r"/Users/[^/]+/(?:Desktop|Documents|Projects|repos)/([A-Za-z0-9_.\-]+)",
-        r"/home/[^/]+/(?:Desktop|Documents|Projects|repos)/([A-Za-z0-9_.\-]+)",
-        r"[A-Za-z]:\\xampp\\htdocs\\([A-Za-z0-9_.\-]+)",
-    ]
-    for raw_p in list(paths) + [all_text]:
-        norm_p = raw_p.replace("\\\\", "\\").replace("/", "\\")
-        for pat in patterns:
-            for m in re.finditer(pat, norm_p, flags=re.IGNORECASE):
-                candidate = m.group(1)
-                proj = _normalize_project_folder_name(candidate, all_text)
-                if proj:
-                    folder_counter[proj] += 3
-                    if not best_workspace_path:
-                        best_workspace_path = m.group(0)
-
-    if folder_counter:
-        top_project = folder_counter.most_common(1)[0][0]
-        return top_project, best_workspace_path
-
-    low_text = _tr_lower(all_text)
-    if "helios" in low_text:
-        return "Helios", ""
-
-    gh_match = re.search(r"github\.com/[A-Za-z0-9_.-]+/([A-Za-z0-9_.-]+)", all_text)
-    if gh_match:
-        return gh_match.group(1), ""
-
-    return "", ""
+def _scratch_qualifies(root: str) -> bool:
+    """A scratch workspace counts as a project only with a root marker directly at its
+    root (the amount of code is irrelevant: copies / backups of other projects)."""
+    return _has_root_marker(Path(root))
 
 
-def _inspect_workspace_folder(workspace_path: str) -> Tuple[str, str, List[str]]:
-    """Inspects the workspace directory (README, package.json, requirements.txt, source files)
-    to extract the project purpose, tech stack, and key files.
-    """
-    if not workspace_path:
-        return "", "", []
-    ws = Path(workspace_path)
-    if not ws.exists():
-        return "", "", []
-    if ws.is_file():
-        ws = ws.parent
-    if not ws.is_dir():
-        return "", "", []
+def _nested_project_root(session: SessionData, scratch_root: str) -> Optional[str]:
+    """The most frequent marker root strictly inside `scratch_root` among the local
+    paths the session touched (a real project nested in a scratch dir), or None."""
+    hits: Counter = Counter()
+    candidates = [p for ex in session.exchanges for p, _e in ex.files] + list(session.tool_paths)
+    for raw in candidates:
+        p = _clean_path_str(raw)
+        if not p or not _is_absolute(p) or not _exists_locally(p):
+            continue
+        if not _relative_to_root(p, scratch_root):
+            continue
+        mr = _find_marker_root(Path(p))
+        if mr is not None and _relative_to_root(str(mr), scratch_root):
+            hits[str(mr)] += 1
+    return hits.most_common(1)[0][0] if hits else None
 
-    purpose = ""
-    techs: List[str] = []
-    key_files: List[str] = []
 
-    for doc_name in ("AGENTS.md", "README.md", "CLAUDE.md"):
-        doc_p = ws / doc_name
-        if doc_p.exists() and doc_p.is_file():
-            try:
-                raw_doc = doc_p.read_text(encoding="utf-8", errors="replace")
-                paras = [
-                    ln.strip()
-                    for ln in raw_doc.splitlines()
-                    if ln.strip() and not ln.strip().startswith(("#", "<!--", "```", "---", "|"))
-                ]
-                if paras:
-                    purpose = " ".join(paras[:3])[:450]
-                    break
-            except Exception:
-                pass
+def _first_requests_line(sessions: List[SessionData]) -> str:
+    """Purpose-evidence line with the first real requests of the earliest sessions
+    (oldest first; noise filtered like the Work History quotes)."""
+    requests: List[str] = []
+    for s in sorted(sessions, key=lambda x: (_session_when(x)[0], x.session_id)):
+        for ex in s.exchanges:
+            if not _is_noise_or_trivial_message(ex.user, ex.ai, ex.used_tools):
+                requests.append(ex.user)
+            if len(requests) >= 12:
+                break
+        if len(requests) >= 12:
+            break
+    return format_session_requests(requests)
 
-    pkg_json = ws / "package.json"
-    if pkg_json.exists() and pkg_json.is_file():
-        try:
-            pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
-            if not purpose and pkg.get("description"):
-                purpose = str(pkg["description"]).strip()
-            deps = list((pkg.get("dependencies") or {}).keys()) + list(
-                (pkg.get("devDependencies") or {}).keys()
-            )
-            for d_name, label in [
-                ("next", "Next.js"),
-                ("react", "React"),
-                ("typescript", "TypeScript"),
-                ("tailwindcss", "Tailwind CSS"),
-                ("@prisma/client", "Prisma"),
-                ("zustand", "Zustand"),
-                ("discord.js", "Discord.js"),
-                ("express", "Express"),
-                ("vite", "Vite"),
-            ]:
-                if d_name in deps and label not in techs:
-                    techs.append(label)
-        except Exception:
-            pass
 
-    req_txt = ws / "requirements.txt"
-    if req_txt.exists() and req_txt.is_file():
-        try:
-            req_raw = req_txt.read_text(encoding="utf-8", errors="replace").lower()
-            for r_key, label in [
-                ("pyside6", "PySide6"),
-                ("fastapi", "FastAPI"),
-                ("flask", "Flask"),
-                ("django", "Django"),
-                ("faster-whisper", "Faster-Whisper"),
-                ("edge-tts", "Edge-TTS"),
-                ("openpyxl", "OpenPyXL"),
-                ("pandas", "Pandas"),
-                ("requests", "Requests"),
-                ("onnxruntime", "ONNX Runtime"),
-            ]:
-                if r_key in req_raw and label not in techs:
-                    techs.append(label)
-        except Exception:
-            pass
-
-    ext_tech_map = {
-        ".py": "Python",
-        ".ts": "TypeScript",
-        ".tsx": "React / TSX",
-        ".js": "Node.js / JS",
-        ".mjs": "Node.js (ESM)",
-        ".php": "PHP",
-        ".sql": "SQL",
-    }
+def _is_local_dir(p: str) -> bool:
+    if not _exists_locally(p):
+        return False
     try:
-        for item in ws.iterdir():
-            if item.is_file() and not item.name.startswith("."):
-                ext = item.suffix.lower()
-                if ext in ext_tech_map:
-                    t_label = ext_tech_map[ext]
-                    if t_label not in techs:
-                        techs.append(t_label)
-                    if len(key_files) < 8:
-                        key_files.append(item.name)
-    except Exception:
-        pass
-
-    return purpose, " • ".join(techs[:7]), key_files
+        return Path(p).is_dir()
+    except OSError:
+        return False
 
 
-def _build_project_core_plan(
-    project_name: str,
-    app_label: str,
-    workspace_path: str,
-    artifacts: List[Path],
-    exchanges: List[Tuple[str, str, List[str]]],
-) -> str:
-    """Builds a clean Core Plan for the central node describing the project's purpose and architecture."""
-    blueprint = PROJECT_BLUEPRINTS.get(project_name)
+# ---------------------------------------------------------------------------
+# Work History module
+# ---------------------------------------------------------------------------
+_TOOL_LINE_RE = re.compile(r"^TOOL: .*\[(\w+)\]\s*$", re.MULTILINE)
+_KIND_LINE_RE = re.compile(r"^KIND: (\w+)\s*$", re.MULTILINE)
+_SESSION_LINE_RE = re.compile(r"^SESSION: (\S+)", re.MULTILINE)
+_WHEN_LINE_RE = re.compile(r"^LAST ACTIVITY: (\S+)", re.MULTILINE)
+_TOOL_COUNT_LINE_RE = re.compile(r"^• (.+) \[(\w+)\]: (.+)$", re.MULTILINE)
 
-    purpose_text = ""
-    stack_text = ""
-    highlights_text = ""
-    ws_purpose, ws_stack, ws_files = _inspect_workspace_folder(workspace_path)
 
-    if blueprint:
-        purpose_text = str(blueprint.get("purpose", ""))
-        stack_text = str(blueprint.get("stack", "")) or ws_stack
-        highlights_text = str(blueprint.get("highlights", ""))
-    else:
-        purpose_text = ws_purpose
-        stack_text = ws_stack
+def _app_label(source: str) -> str:
+    return str(SOURCE_CATEGORIES.get(source, {}).get("title", source))
 
-        if not purpose_text and artifacts:
-            for art in artifacts:
-                try:
-                    raw_art = art.read_text(encoding="utf-8", errors="replace")
-                    paras = [
-                        ln.strip()
-                        for ln in raw_art.splitlines()
-                        if ln.strip() and not ln.strip().startswith(("#", "- [", "`"))
-                    ]
-                    if paras:
-                        purpose_text = " ".join(paras[:2])[:420]
-                        break
-                except Exception:
-                    pass
 
-        extracted_goals: List[str] = []
-        for u_m, a_m, _ in exchanges:
-            if _is_noise_or_trivial_message(u_m, a_m):
+def _session_when(s: SessionData) -> Tuple[str, str]:
+    """(sortable UTC ISO time, how it was obtained)."""
+    if s.last_ts:
+        ts = s.last_ts.replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S"), "log timestamps, UTC"
+        except ValueError:
+            return ts[:19], "log timestamps"
+    if s.mtime:
+        return datetime.fromtimestamp(s.mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"), "log file modification time, UTC"
+    return "0000-00-00T00:00:00", "unknown"
+
+
+def _touched_files(s: SessionData, root: str) -> Tuple[List[str], List[str]]:
+    """(changed, read-only) project-relative paths touched by tool calls, most frequent first."""
+    changed: Counter = Counter()
+    read: Counter = Counter()
+    order: Dict[str, int] = {}
+    for ex in s.exchanges:
+        for p, edited in ex.files:
+            rel = _relative_to_root(p, root) if _is_absolute(_clean_path_str(p)) else None
+            if not rel or rel.startswith(".."):
                 continue
-            feat = _extract_clean_feature_title(u_m, a_m)
-            if feat and feat not in extracted_goals:
-                extracted_goals.append(f"• {feat}")
-            if not purpose_text:
-                clean_u = u_m.strip().splitlines()[0][:240]
-                if len(clean_u) > 20:
-                    purpose_text = f"Architectural and development work for {project_name}: {clean_u}"
+            order.setdefault(rel, len(order))
+            (changed if edited else read)[rel] += 1
+    rank = lambda c: sorted(c, key=lambda r: (-c[r], order[r]))  # noqa: E731
+    changed_l = rank(changed)
+    read_l = [r for r in rank(read) if r not in changed]
+    return changed_l, read_l
 
-        if extracted_goals and not highlights_text:
-            highlights_text = "\n".join(extracted_goals[:5])
 
-    parts = [
-        f"PROJECT PURPOSE & OVERVIEW (WHAT IT DOES):\n{purpose_text or f'{project_name} software project and architectural components.'}",
+def _clip(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _session_label(changed: List[str], read: List[str]) -> str:
+    names = list(dict.fromkeys(posixpath.basename(r) for r in (changed or read)))
+    if not names:
+        return "no project files touched"
+    label = ", ".join(names[:2])
+    if len(names) > 2:
+        label += f" (+{len(names) - 2})"
+    return _clip(label, 60)
+
+
+def _session_satellite(s: SessionData, source: str, root: str) -> SatelliteNode:
+    when, how = _session_when(s)
+    changed, read = _touched_files(s, root)
+    title = f"{when[:10]} — {_session_label(changed, read)}"
+    requests = [
+        f'• "{_clip(ex.user, REQUEST_CHAR_LIMIT)}"'
+        for ex in s.exchanges
+        if not _is_noise_or_trivial_message(ex.user, ex.ai, ex.used_tools)
     ]
-    if highlights_text:
-        parts.append(f"\nCORE ARCHITECTURE & FEATURES:\n{highlights_text}")
-    if stack_text:
-        parts.append(f"\nTECH STACK:\n{stack_text}")
-    if ws_files:
-        parts.append(f"\nKEY FILES: {', '.join(ws_files[:6])}")
-
-    meta_lines = [f"\nAPPLICATION SOURCE: {app_label}"]
-    if workspace_path:
-        meta_lines.append(f"WORKSPACE PATH: {workspace_path}")
-    parts.append("\n".join(meta_lines))
-
-    return "\n".join(parts)
-
-
-def _merge_or_populate_system(
-    existing: SolarSystem,
-    new_core_plan: str,
-    workspace_path: str,
-    exchanges: List[Tuple[str, str, List[str]]],
-    artifacts: Optional[List[Path]] = None,
-) -> None:
-    """Updates a project while preserving manual user edits and Ollama verification blocks."""
-    if not existing.is_user_modified:
-        ollama_tail = ""
-        marker = "[OLLAMA VERIFIED ARCHITECTURE ANALYSIS"
-        if marker in existing.core_plan:
-            idx = existing.core_plan.find(marker)
-            ollama_tail = "\n\n" + existing.core_plan[idx:]
-        existing.core_plan = new_core_plan + ollama_tail
-
-    if workspace_path and not existing.workspace_path:
-        existing.workspace_path = workspace_path
-
-    user_planets = [p for p in existing.planets if p.is_user_modified]
-    user_sats_by_layer: Dict[str, List] = {}
-    for p in existing.planets:
-        mod_sats = [s for s in p.satellites if s.is_user_modified]
-        if mod_sats:
-            user_sats_by_layer.setdefault(p.layer, []).extend(mod_sats)
-
-    captured_links = existing.capture_user_links()
-
-    existing.planets = []
-    existing.links = []
-    _populate_clean_semantic_planets(existing, exchanges, artifacts)
-
-    existing_titles = {_tr_lower(p.title): p for p in existing.planets}
-    for up in user_planets:
-        key = _tr_lower(up.title)
-        if key in existing_titles:
-            target_p = existing_titles[key]
-            target_p.summary = up.summary
-            target_p.color = up.color
-            target_p.angle = up.angle
-            target_p.orbit_radius = up.orbit_radius
-            target_p.is_user_modified = True
-        else:
-            existing.planets.append(up)
-
-    for layer_key, sat_list in user_sats_by_layer.items():
-        target_p = next((p for p in existing.planets if p.layer == layer_key), None)
-        if target_p:
-            sat_titles = {_tr_lower(s.title) for s in target_p.satellites}
-            for us in sat_list:
-                if _tr_lower(us.title) not in sat_titles:
-                    target_p.satellites.append(us)
-
-    existing.restore_user_links(captured_links)
-    existing.rebuild_links_and_tour()
+    tools = Counter(t.split(":")[0].strip() for ex in s.exchanges for t in ex.tools)
+    lines = [
+        f"TOOL: {_app_label(source)} [{source}]",
+        "KIND: session",
+        f"SESSION: {s.session_id}",
+        f"LAST ACTIVITY: {when} (from {how})",
+    ]
+    if s.log_path:
+        lines.append(f"LOG FILE: {s.log_path}")
+    lines.append(f"\nREQUESTS IN THIS SESSION (quoted from the log, first {REQUESTS_PER_SESSION}, truncated):")
+    lines.append("\n".join(requests[:REQUESTS_PER_SESSION]) or "• (only short follow-ups such as 'continue', or no user text)")
+    if len(requests) > REQUESTS_PER_SESSION:
+        lines.append(f"• … +{len(requests) - REQUESTS_PER_SESSION} more requests")
+    lines.append(f"\nFILES CHANGED BY TOOL CALLS ({len(changed)}): " + (", ".join(changed[:12]) + (" …" if len(changed) > 12 else "") if changed else "none"))
+    if read:
+        lines.append(f"FILES READ ({len(read)}): " + ", ".join(read[:12]) + (" …" if len(read) > 12 else ""))
+    lines.append("TOOLS USED: " + (", ".join(f"{t} ×{c}" for t, c in tools.most_common(8)) if tools else "none"))
+    lines.append("\nThis is session history, not architecture. The title is built from the date and the files touched.")
+    return SatelliteNode(title=title, content="\n".join(lines), visual_tag="thought", file_path=s.log_path)
 
 
-def _classify_exchange_layer(title: str, user_msg: str, ai_msg: str, tools: List[str]) -> Tuple[str, str]:
-    """Maps a feature or step to an architectural layer and sub-component visual tag."""
-    combined = _tr_lower(f"{title}\n{user_msg[:300]}\n{ai_msg[:400]}\n{' '.join(tools)}")
-
-    if any(k in combined for k in ("ui", "canvas", "window", "pyside", "css", "html", "color", "design", "mobile", "frontend", "react", "navbar", "page", "theme", "tui", "terminal", "view", "widget")):
-        return "ui", "diagram"
-    if any(k in combined for k in ("security", "audit", "tls", "cors", "zap", "rate", "limit", "test", "validation", "captcha", "allowlist", "auth", "permission")):
-        return "testing", "code"
-    if any(k in combined for k in ("search_web", "research", "github.com", "inspect", "compare", "analyze", "server", "ubuntu", "benchmark")):
-        return "research", "thought"
-    if any(k in combined for k in ("connector", "bridge", "mcp", "api", "importer", "skill", "plugin", "bot", "discord", "telegram", "whisper", "ollama", "webhook")):
-        return "integration", "code"
-    if any(k in combined for k in ("model", "database", "sqlite", "mysql", "prisma", "json", "store", "core", "class", "algorithm", "score", "chapter", "excel", "report", "schema")):
-        return "core", "code"
-    return "architecture", "idea"
-
-
-def _populate_clean_semantic_planets(
-    system: SolarSystem,
-    exchanges: List[Tuple[str, str, List[str]]],
-    artifacts: Optional[List[Path]] = None,
-) -> None:
-    """Builds the project's architectural layers and sub-components without conversational noise."""
-    blueprint = PROJECT_BLUEPRINTS.get(system.project_name)
-    curated_map = blueprint.get("curated_planets", {}) if blueprint else {}
-    curated_list = curated_map.get(system.source) if isinstance(curated_map, dict) else None
-
-    if curated_list:
-        for p_title, p_layer, p_summary, sat_list in curated_list:
-            _, color = LAYER_DEFINITIONS.get(p_layer, ("Module", "#4EA8DE"))
-            planet = system.add_planet(
-                title=p_title,
-                summary=p_summary,
-                color=color,
-                layer=p_layer,
+def _artifact_satellites(sessions: List[SessionData], source: str) -> List[SatelliteNode]:
+    out: List[SatelliteNode] = []
+    seen: Set[str] = set()
+    for s in sorted(sessions, key=lambda x: _session_when(x)[0], reverse=True):
+        when, _how = _session_when(s)
+        for art in reversed(s.artifacts):
+            if len(out) >= HISTORY_ARTIFACT_CAP:
+                return out
+            try:
+                text = art.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            h1 = re.search(r"^#\s+(.+)$", text, flags=re.MULTILINE)
+            if not text or not h1:
+                continue
+            title = _clip(re.sub(r"[*_`#]+", "", h1.group(1)), 50)
+            if not title or _tr_lower(title) in seen:
+                continue
+            seen.add(_tr_lower(title))
+            content = (
+                f"TOOL: {_app_label(source)} [{source}]\nKIND: artifact\nSESSION: {s.session_id}\nLAST ACTIVITY: {when}\n"
+                f"ARTIFACT FILE: {art}\n\nPlan / design document written during an {_app_label(source)} session "
+                f"(title = its first heading). It describes intended work, not verified architecture.\n\n"
+                f"EXCERPT:\n{text[:900]}"
             )
-            for s_title, s_content, s_tag in sat_list:
-                planet.add_satellite(
-                    title=s_title,
-                    content=s_content,
-                    visual_tag=s_tag,
-                )
-        system.rebuild_links_and_tour()
+            out.append(SatelliteNode(title=title, content=content, visual_tag="diagram", file_path=str(art)))
+    return out
+
+
+def _sat_meta(sat: SatelliteNode) -> Tuple[str, str, str]:
+    """(tool source, kind, sortable time) parsed from a history sub-component."""
+    tool = _TOOL_LINE_RE.search(sat.content or "")
+    kind = _KIND_LINE_RE.search(sat.content or "")
+    when = _WHEN_LINE_RE.search(sat.content or "")
+    return (tool.group(1) if tool else "", kind.group(1) if kind else "", when.group(1) if when else "")
+
+
+def _upsert_history_planet(system: SolarSystem, source: str, sessions: List[SessionData], root: str) -> PlanetNode:
+    """Adds or refreshes the single Work History module of `system` with this tool's
+    sessions, keeping other tools' entries and user-modified sub-components."""
+    planet = next((p for p in system.planets if p.kind == "history"), None)
+    if planet is None:
+        planet = system.add_planet(
+            title=HISTORY_PLANET_TITLE, summary="", color=LAYER_DEFINITIONS["docs"][1], layer="docs"
+        )
+        planet.kind = "history"
+        planet.file_path = ""
+    old_summary = planet.summary or ""
+
+    user_sats = [s for s in planet.satellites if s.is_user_modified]
+    others = [s for s in planet.satellites if not s.is_user_modified and _sat_meta(s)[0] not in ("", source)]
+    # A session entry the user edited replaces the regenerated entry of that session.
+    user_ids = {m.group(1) for s in user_sats for m in [_SESSION_LINE_RE.search(s.content or "")] if m}
+    fresh = [_session_satellite(s, source, root) for s in sessions if s.session_id not in user_ids]
+    fresh += _artifact_satellites(sessions, source)
+    pool = others + fresh
+    sess = sorted((s for s in pool if _sat_meta(s)[1] == "session"), key=lambda s: _sat_meta(s)[2], reverse=True)
+    arts = sorted((s for s in pool if _sat_meta(s)[1] == "artifact"), key=lambda s: _sat_meta(s)[2], reverse=True)
+    hidden = max(0, len(sess) - HISTORY_SESSION_CAP)
+    chosen = sess[:HISTORY_SESSION_CAP] + arts[:HISTORY_ARTIFACT_CAP]
+
+    taken = {_tr_lower(s.title.strip()) for s in user_sats}
+    for sat in chosen:
+        base, n = sat.title, 2
+        while _tr_lower(sat.title.strip()) in taken:
+            sat.title = f"{base} ({n})"
+            n += 1
+        taken.add(_tr_lower(sat.title.strip()))
+    planet.satellites = chosen + user_sats
+    planet.rebalance_satellites()
+
+    if not planet.is_user_modified:
+        per_tool: Dict[str, str] = {}
+        for m in _TOOL_COUNT_LINE_RE.finditer(old_summary):
+            if m.group(2) != source and m.group(2) in AGENT_SOURCES:
+                per_tool[m.group(2)] = f"• {m.group(1)} [{m.group(2)}]: {m.group(3)}"
+        dates = sorted(_session_when(s)[0][:10] for s in sessions)
+        span = f", {dates[0]} to {dates[-1]}" if dates else ""
+        per_tool[source] = f"• {_app_label(source)} [{source}]: {len(sessions)} session(s) in the latest scan{span}"
+        name = system.project_name or system.name
+        planet.summary = "\n".join(
+            [
+                "SESSION HISTORY (NOT ARCHITECTURE):",
+                f"AI coding sessions recorded for {name}. This module is history only: the other modules and "
+                "their links come from the source code, not from these sessions.",
+                "\nSESSIONS PER TOOL (latest scan of each tool):",
+                "\n".join(per_tool[k] for k in AGENT_SOURCES if k in per_tool),
+                f"\nSHOWN: the {min(len(sess), HISTORY_SESSION_CAP)} most recent session(s)"
+                + (f" (+{hidden} older not shown)" if hidden else "")
+                + (f" and {len(arts[:HISTORY_ARTIFACT_CAP])} plan/design document(s)" if arts else "")
+                + ".",
+                "\nHOW THIS WAS DERIVED:\n• Dates from log timestamps (else the log file's modification time).\n"
+                "• Titles from the files touched by tool calls; requests are quoted verbatim (truncated) from the logs.",
+            ]
+        )
+    return planet
+
+
+# ---------------------------------------------------------------------------
+# Streaming helpers
+# ---------------------------------------------------------------------------
+def _iter_jsonl(path: Path, max_lines: int = MAX_JSONL_LINES, max_bytes: int = MAX_JSONL_BYTES) -> Iterator[dict]:
+    """Yields JSON objects from a .jsonl file, streaming, capped by lines and bytes."""
+    read = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                read += len(line)
+                if read > max_bytes:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError:
         return
 
-    planet_by_layer: Dict[str, PlanetNode] = {p.layer: p for p in system.planets}
-    seen_titles: Set[str] = set()
 
-    layer_role_descriptions = {
-        "architecture": "Manages the overall system architecture, configuration files, design rules, and roadmap.",
-        "core": "Contains domain data models, database schemas, core algorithms, and primary business services.",
-        "integration": "Manages external APIs, AI models, bots, data fetchers, and inter-system communication bridges.",
-        "ui": "Provides user-facing screens, visual components, theme styling, and interactive workflows.",
-        "testing": "Handles security checks, permission validation, error handling, and automated test suites.",
-        "docs": "Contains technical design documents, architectural plans, task lists, and user guides.",
-        "research": "Houses technical feasibility studies, library comparisons, and exploratory analyses.",
-    }
+def _safe_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
 
-    def get_or_create_layer_planet(layer_key: str) -> PlanetNode:
-        if layer_key in planet_by_layer:
-            return planet_by_layer[layer_key]
-        title, color = LAYER_DEFINITIONS.get(layer_key, ("Project Module", "#4EA8DE"))
-        role_desc = layer_role_descriptions.get(
-            layer_key,
-            "Contains the core components and technical decisions for this architectural layer.",
-        )
-        p = system.add_planet(
-            title=title,
-            summary=(
-                f"MODULE PURPOSE & ROLE:\n"
-                f"In {system.project_name}, {role_desc}\n\n"
-                f"HOW IT WORKS & TECHNICAL FLOW:\n"
-                f"• Sub-components under this module fulfill the '{title}' responsibilities of the project."
-            ),
-            color=color,
-            layer=layer_key,
-        )
-        planet_by_layer[layer_key] = p
-        return p
 
-    if artifacts:
-        for art in artifacts[:6]:
-            try:
-                art_text = art.read_text(encoding="utf-8", errors="replace").strip()
-            except Exception:
-                continue
-            if not art_text:
-                continue
-            h1_match = re.search(r"^#\s+(.+)$", art_text, flags=re.MULTILINE)
-            art_title = h1_match.group(1).strip() if h1_match else art.stem.replace("_", " ").title()
-            art_title = re.sub(r"[*_`#]+", "", art_title).strip()
-            if len(art_title) > 40:
-                art_title = art_title[:39].rstrip() + "…"
-            norm_key = _tr_lower(art_title)
-            if norm_key in seen_titles:
-                continue
-            seen_titles.add(norm_key)
+_EDIT_TOOL_RE = re.compile(r"(?i)(write|edit|replace|create|patch|apply|insert|delete|rename|move|save|notebookedit)")
+_PATH_ARG_RE = re.compile(r"(?i)(path|paths|file|files|dir|directory|cwd|uri|targetfile|workdir)$")
+_DIR_ARG_RE = re.compile(r"(?i)(dir|directory|directorypath|cwd|searchpath|workdir|searchdirectory)$")
 
-            doc_planet = get_or_create_layer_planet("docs")
-            doc_planet.add_satellite(
-                title=art_title,
-                content=(
-                    f"WHAT IT DOES:\n"
-                    f"Contains the technical plan, architectural design, and implementation steps defined in `{art.name}`.\n\n"
-                    f"HOW IT WORKS & TECHNICAL DETAILS:\n"
-                    f"{art_text[:950]}\n\n"
-                    f"RELATED FILE: `{art}`"
-                ),
-                visual_tag="diagram",
-                file_path=str(art),
-            )
 
-    for u_msg, ai_msg, tools in exchanges:
-        if _is_noise_or_trivial_message(u_msg, ai_msg):
+def _looks_like_path(v: str) -> bool:
+    v = v.strip()
+    return bool(v) and "\n" not in v and len(v) < 500 and (_is_absolute(v) or "/" in v or "\\" in v or "." in v)
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE)
+_PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
+
+
+def _paths_from_args(args: dict) -> Tuple[List[str], List[str]]:
+    """Returns (file-like path arguments, other path hints) from tool-call arguments."""
+    file_like: List[str] = []
+    hints: List[str] = []
+    for k, v in args.items():
+        if isinstance(v, str):
+            if _PATH_ARG_RE.search(k):
+                val = _clean_path_str(v)
+                if val and _looks_like_path(val):
+                    if _DIR_ARG_RE.search(k):
+                        hints.append(val)
+                    else:
+                        file_like.append(val)
+            elif re.search(r"(?i)(command|cmd|commandline)", k):
+                hints.extend(_extract_paths_from_text(v))
+        elif isinstance(v, list) and re.search(r"(?i)(paths|files)$", k):
+            file_like.extend(_clean_path_str(x) for x in v if isinstance(x, str) and _looks_like_path(x))
+    return file_like, hints
+
+
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+def _count_codex_sessions(codex_path: Path) -> Tuple[int, bool]:
+    count, visited = 0, 0
+    for sub in ("sessions", "archived_sessions"):
+        base = codex_path / sub
+        if not base.is_dir():
             continue
-        if len(ai_msg.strip()) < 80:
-            continue
-
-        feat_title = _extract_clean_feature_title(u_msg, ai_msg)
-        if not feat_title:
-            continue
-
-        norm_key = _tr_lower(feat_title)
-        if norm_key in seen_titles:
-            continue
-
-        layer_key, v_tag = _classify_exchange_layer(feat_title, u_msg, ai_msg, tools)
-        planet = get_or_create_layer_planet(layer_key)
-        if len(planet.satellites) >= 6:
-            continue
-
-        seen_titles.add(norm_key)
-        tool_line = f"\n\nTOOLS / OPERATIONS USED: {', '.join(tools[:5])}" if tools else ""
-        planet.add_satellite(
-            title=feat_title,
-            content=(
-                f"WHAT IT DOES:\n"
-                f"{u_msg.strip()[:380]}\n\n"
-                f"HOW IT WORKS & TECHNICAL DETAILS:\n"
-                f"{ai_msg.strip()[:900]}"
-                f"{tool_line}"
-            ),
-            visual_tag=v_tag,
-        )
-
-    for l_key, p_node in planet_by_layer.items():
-        if p_node.satellites:
-            role_desc = layer_role_descriptions.get(l_key, "")
-            sat_bullets = "\n".join(f"• {s.title}" for s in p_node.satellites)
-            p_node.summary = (
-                f"MODULE PURPOSE & ROLE:\n"
-                f"In {system.project_name}, {role_desc}\n\n"
-                f"SUB-COMPONENTS IN THIS MODULE ({len(p_node.satellites)}):\n"
-                f"{sat_bullets}\n\n"
-                f"HOW IT WORKS & TECHNICAL FLOW:\n"
-                f"• Click any sub-component under this module to inspect its purpose and technical implementation details."
-            )
-
-    system.rebuild_links_and_tour()
+        for _dirpath, dirnames, filenames in os.walk(base):
+            visited += 1 + len(dirnames) + len(filenames)
+            count += sum(1 for f in filenames if f.endswith(".jsonl"))
+            if visited >= DETECTOR_WALK_CAP:
+                return count, True
+    return count, False
 
 
 class AgentDetector:
@@ -821,10 +960,9 @@ class AgentDetector:
                 ag_count = sum(
                     1
                     for d in ag_path.iterdir()
-                    if d.is_dir()
-                    and (d / ".system_generated" / "logs" / "transcript.jsonl").exists()
+                    if d.is_dir() and (d / ".system_generated" / "logs" / "transcript.jsonl").exists()
                 )
-            except Exception:
+            except OSError:
                 ag_count = 0
         results["antigravity"] = {
             "name": "Google Antigravity",
@@ -835,28 +973,29 @@ class AgentDetector:
             "status": f"{ag_count} sessions found" if ag_count > 0 else "No sessions found",
             "color": "#3B82F6",
             "path": "~/.gemini/antigravity/brain",
-            "description": "Imports workspace history, architectural plans, and code decisions into the graph.",
+            "description": "Finds the project folders of Antigravity sessions, maps them from their code and adds a Work History of the sessions.",
             "tags": [],
         }
 
-        # 2. OpenAI Codex
+        # 2. OpenAI Codex: count session rollout files (capped walk; runs on the UI thread)
         codex_path = home / ".codex"
-        codex_count = 0
+        codex_count, capped = 0, False
         if codex_path.exists():
             try:
-                codex_count = sum(1 for f in codex_path.glob("*") if f.is_file() or f.is_dir())
-            except Exception:
+                codex_count, capped = _count_codex_sessions(codex_path)
+            except OSError:
                 codex_count = 0
+        count_label = f"{codex_count}+" if capped else str(codex_count)
         results["codex"] = {
             "name": "OpenAI Codex",
             "brand": "CLI & Code Agent",
             "icon": "CX",
             "detected": codex_path.exists() and codex_count > 0,
             "count": codex_count,
-            "status": f"{codex_count} records found" if codex_count > 0 else "Not detected",
+            "status": f"{count_label} sessions found" if codex_count > 0 else ("No sessions found" if codex_path.exists() else "Not detected"),
             "color": "#10B981",
             "path": "~/.codex",
-            "description": "Converts Codex CLI sessions and module history into structured projects.",
+            "description": "Finds the project folders of Codex sessions (working directory), maps them from their code and adds a Work History.",
             "tags": [],
         }
 
@@ -868,7 +1007,7 @@ class AgentDetector:
         if p_proj and p_proj.exists():
             try:
                 claude_count = sum(1 for d in p_proj.iterdir() if d.is_dir())
-            except Exception:
+            except OSError:
                 claude_count = 0
         claude_detected = claude_path.exists() or bool(claude_cli)
         results["claude_code"] = {
@@ -880,7 +1019,7 @@ class AgentDetector:
             "status": f"{claude_count} projects found" if claude_detected else "Not installed",
             "color": "#D97706",
             "path": "~/.claude",
-            "description": "Synchronizes Claude Code projects and CLAUDE.md architecture definitions.",
+            "description": "Finds the project folders of Claude Code sessions, maps them from their code and adds a Work History.",
             "tags": [],
         }
 
@@ -894,10 +1033,11 @@ class AgentDetector:
                 for f in models_dir.rglob("*"):
                     if f.is_file():
                         ollama_models.append(f"{f.parent.name}:{f.name}")
-            except Exception:
+            except OSError:
                 pass
 
         import urllib.request
+
         ollama_running = False
         try:
             req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
@@ -915,9 +1055,7 @@ class AgentDetector:
             "running": ollama_running,
             "models": ollama_models,
             "status": (
-                f"{len(ollama_models)} models installed"
-                if ollama_models
-                else ("Service ready" if ollama_exists else "Not installed")
+                f"{len(ollama_models)} models installed" if ollama_models else ("Service ready" if ollama_exists else "Not installed")
             ),
             "color": "#64748B",
             "path": "127.0.0.1:11434",
@@ -938,8 +1076,43 @@ class AgentDetector:
             "description": "Analyzes project folders directly from source code structure and imports.",
             "tags": [],
         }
-
         return results
+
+
+# ---------------------------------------------------------------------------
+# Importer
+# ---------------------------------------------------------------------------
+_PATH_LIST_KEYS = ("skipped_missing_workspace", "skipped_no_code", "skipped_scratch", "skipped_ignored", "removed_stale")
+
+
+def _new_stats(source: str) -> Dict[str, object]:
+    stats: Dict[str, object] = {
+        "sessions_found": 0,
+        "sessions_parsed": 0,
+        "sessions_failed": 0,
+        "skipped_no_workspace": 0,  # sessions without a resolvable folder
+        "skipped_no_content": 0,  # sessions without any request / tool call / artifact
+        "skipped_missing_workspace": 0,  # folders (not sessions) from here on
+        "skipped_no_code": 0,
+        "skipped_scratch": 0,
+        "skipped_ignored": 0,
+        "removed_stale": 0,
+        "merged_duplicates": 0,
+        "projects_created": 0,
+        "projects_updated": 0,
+        "projects_failed": 0,
+    }
+    for key in _PATH_LIST_KEYS:
+        stats[f"{key}_paths"] = []
+    LAST_SCAN_STATS[source] = stats
+    return stats
+
+
+def _count(stats: Dict[str, object], key: str, path: str = "") -> None:
+    stats[key] = int(stats.get(key, 0)) + 1  # type: ignore[arg-type]
+    paths = stats.get(f"{key}_paths")
+    if path and isinstance(paths, list) and len(paths) < STATS_PATH_CAP and path not in paths:
+        paths.append(path)
 
 
 class AgentHistoryImporter:
@@ -947,7 +1120,7 @@ class AgentHistoryImporter:
 
     @staticmethod
     def scan_all_into_store(store: GalaxyStore, max_sessions: int = 30) -> int:
-        """Scans all supported local AI tools and adds projects under their respective source categories."""
+        """Scans all supported local AI tools; returns the number of projects created or updated."""
         added_count = 0
         added_count += AgentHistoryImporter.scan_antigravity(store, max_sessions=max_sessions)
         added_count += AgentHistoryImporter.scan_codex(store, max_sessions=60)
@@ -956,11 +1129,7 @@ class AgentHistoryImporter:
         return added_count
 
     @staticmethod
-    def scan_selected_sources(
-        store: GalaxyStore,
-        sources: List[str],
-        max_sessions: int = 25,
-    ) -> int:
+    def scan_selected_sources(store: GalaxyStore, sources: List[str], max_sessions: int = 25) -> int:
         """Scans only the AI sources selected by the user."""
         added_count = 0
         if "antigravity" in sources:
@@ -972,147 +1141,265 @@ class AgentHistoryImporter:
         store.save()
         return added_count
 
+    # ---- shared grouping / store update ----------------------------------
+    @staticmethod
+    def _folder_systems(store: GalaxyStore, source: str, root: str, names: Iterable[str] = ()) -> List[SolarSystem]:
+        """Systems for this folder under any non-manual source, plus legacy entries of
+        this source (old `source:name` ids or no workspace path but the same name)."""
+        found = find_systems_for_folder(store, root)
+        key = _path_key(root)
+        targets = _identity_keys(root)
+        for s in store.systems:
+            if s.source != source or s in found:
+                continue
+            if s.workspace_path and not (_identity_keys(s.workspace_path) & targets):
+                continue
+            if s.source_id == f"{source}:{key}":
+                found.append(s)
+                continue
+            if not s.workspace_path:
+                for name in names:
+                    low = name.strip().lower()
+                    if s.source_id == f"{source}:{_tr_lower(name)}" or low in {s.project_name.strip().lower(), s.name.strip().lower()}:
+                        found.append(s)
+                        break
+        return found
+
+    @staticmethod
+    def _remove_stale(store: GalaxyStore, source: str, root: str, stats: Dict[str, object]) -> None:
+        """Removes old agent-made systems for a folder that is no longer a project, but
+        only if nothing in them is user-made and no codebase scan ever produced them."""
+        for s in AgentHistoryImporter._folder_systems(store, source, root, [_display_name(root)]):
+            if s.source not in AGENT_SOURCES or "codebase" in (s.sources or []) or has_user_made_content(s):
+                continue
+            if s in store.systems:
+                store.systems.remove(s)
+                _count(stats, "removed_stale", s.workspace_path or root)
+
+    @staticmethod
+    def _import_sessions(store: GalaxyStore, source: str, app_label: str, sessions: List[SessionData], stats: Dict[str, object]) -> int:
+        groups: Dict[str, Dict[str, object]] = {}
+        for s in sessions:
+            if not s.exchanges and not s.artifacts:
+                _count(stats, "skipped_no_content")
+                continue
+            res = _resolve_project_root(s.cwd, s.tool_paths)
+            if res is None:
+                _count(stats, "skipped_no_workspace")
+                continue
+            key, root, name, confirmed = res
+            g = groups.setdefault(key, {"root": root, "names": Counter(), "sessions": [], "confirmed": confirmed})
+            g["names"][name] += 1  # type: ignore[index]
+            g["sessions"].append(s)  # type: ignore[union-attr]
+            g["confirmed"] = bool(g["confirmed"]) or confirmed
+
+        # Merge unconfirmed (non-local) roots into an ancestor root seen in the same scan.
+        for key in sorted(groups, key=len, reverse=True):
+            g = groups.get(key)
+            if g is None or g["confirmed"]:
+                continue
+            for other in sorted(groups, key=len):
+                if other != key and len(other) < len(key):
+                    sep = "\\" if _is_windows_path(str(groups[other]["root"])) else "/"
+                    if key.startswith(other.rstrip(sep) + sep):
+                        groups[other]["sessions"].extend(g["sessions"])  # type: ignore[union-attr]
+                        groups[other]["names"].update(g["names"])  # type: ignore[union-attr]
+                        del groups[key]
+                        break
+
+        # Pass 1: keep only folders that exist here; re-route scratch dirs to nested projects.
+        final: Dict[str, Dict[str, object]] = {}
+
+        def add_final(root: str, ss: List[SessionData]) -> None:
+            f = final.setdefault(_path_key(root), {"root": root, "sessions": []})
+            f["sessions"].extend(ss)  # type: ignore[union-attr]
+
+        ignored = ignored_folder_keys(store)
+        for key, g in groups.items():
+            root = str(g["root"])
+            sess: List[SessionData] = list(g["sessions"])  # type: ignore[arg-type]
+            if is_ignored_folder(store, root, ignored):
+                _count(stats, "skipped_ignored", root)
+                continue
+            if not _is_local_dir(root):
+                _count(stats, "skipped_missing_workspace", root)
+                AgentHistoryImporter._remove_stale(store, source, root, stats)
+                continue
+            if _is_scratch_path(root) and not _scratch_qualifies(root):
+                rerouted: Dict[str, List[SessionData]] = defaultdict(list)
+                left = 0
+                for s in sess:
+                    nested = _nested_project_root(s, root)
+                    if nested:
+                        rerouted[nested].append(s)
+                    else:
+                        left += 1
+                for nested, ss in rerouted.items():
+                    add_final(nested, ss)
+                if left:
+                    _count(stats, "skipped_scratch", root)
+                AgentHistoryImporter._remove_stale(store, source, root, stats)
+                continue
+            add_final(root, sess)
+
+        # Pass 2: build each project from its code and attach the history.
+        updated = 0
+        for key, g in final.items():
+            if is_ignored_folder(store, str(g["root"]), ignored):  # a nested project inside an ignored folder
+                _count(stats, "skipped_ignored", str(g["root"]))
+                continue
+            try:
+                updated += AgentHistoryImporter._update_project(store, source, str(g["root"]), list(g["sessions"]), stats)  # type: ignore[arg-type]
+            except Exception:
+                _count(stats, "projects_failed")
+                logger.exception("Failed to import %s project %s", source, key)
+        return updated
+
+    @staticmethod
+    def _update_project(store: GalaxyStore, source: str, root: str, sessions: List[SessionData], stats: Dict[str, object]) -> int:
+        folder = Path(root)
+        name = _display_name(root)
+        key = _path_key(root)
+        fresh = SolarSystem(
+            name=name,
+            project_name=name,
+            sun_title=name,
+            core_plan="",
+            source=source,
+            source_id=f"{source}:{key}",
+            workspace_path=root,
+        )
+        code = build_code_map(folder, fresh)
+        if code.code_files == 0:
+            _count(stats, "skipped_no_code", root)
+            AgentHistoryImporter._remove_stale(store, source, root, stats)
+            return 0
+        fresh.purpose_evidence = compose_purpose_evidence(code.purpose_items, _first_requests_line(sessions))
+
+        matches = AgentHistoryImporter._folder_systems(store, source, root, [name])
+        existing, removed = consolidate_folder_systems(store, matches)
+        stats["merged_duplicates"] = int(stats.get("merged_duplicates", 0)) + removed  # type: ignore[arg-type]
+
+        if existing is None:
+            excluded = {id(s) for s in matches}
+            clash = any(
+                id(s) not in excluded and s.source != "manual" and name.lower() in {s.project_name.strip().lower(), s.name.strip().lower()}
+                for s in store.systems
+            )
+            if clash:
+                parent = _pure(root).parent.name
+                if parent:
+                    fresh.name = fresh.project_name = fresh.sun_title = f"{name} ({parent})"
+            _upsert_history_planet(fresh, source, sessions, root)
+            fresh.core_plan = code.core_plan + history_note(fresh)
+            real_links = list(fresh.links)
+            added = store.add_system(fresh)
+            if added.links != real_links:
+                added.links = real_links
+                store.save()
+            _count(stats, "projects_created")
+            return 1
+
+        add_source(existing, source)
+        _upsert_history_planet(existing, source, sessions, root)
+        has_ua = any((folder / d / "knowledge-graph.json").exists() for d in (".ua", ".understand-anything"))
+        if existing.source == "codebase" and has_ua:
+            _keep_only_real_links(existing)  # keep the imported .ua graph; only the history changes
+            merge_purpose(existing, fresh)
+            merge_identity(existing, fresh)
+            update_core_plan_purpose(existing)
+        else:
+            refresh_system_from_code(existing, fresh, code.core_plan)
+        if not existing.workspace_path:
+            existing.workspace_path = root
+        _count(stats, "projects_updated")
+        return 1
+
+    # ---- Antigravity ----------------------------------------------------
     @staticmethod
     def scan_antigravity(store: GalaxyStore, max_sessions: int = 25) -> int:
-        """Scans local Antigravity history (~/.gemini/antigravity/brain) and merges sessions by project name."""
+        """Scans local Antigravity history (~/.gemini/antigravity/brain) and merges sessions by project root."""
+        stats = _new_stats("antigravity")
         brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
         if not brain_dir.exists():
             return 0
+        try:
+            session_dirs = [d for d in brain_dir.iterdir() if d.is_dir()]
+        except OSError:
+            return 0
+        session_dirs.sort(key=_safe_mtime, reverse=True)
 
-        session_dirs = [d for d in brain_dir.iterdir() if d.is_dir()]
-        session_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-
-        grouped: Dict[str, List[Tuple[str, Path, List[Tuple[str, str, List[str]]], List[Path], str]]] = {}
-
+        sessions: List[SessionData] = []
         for s_dir in session_dirs[:max_sessions]:
-            session_id = s_dir.name
             transcript_path = s_dir / ".system_generated" / "logs" / "transcript.jsonl"
             if not transcript_path.exists():
                 continue
-
-            exchanges, paths, artifacts = AgentHistoryImporter._extract_antigravity_data(
-                s_dir, transcript_path
-            )
-            if not exchanges and not artifacts:
+            stats["sessions_found"] += 1
+            try:
+                data = AgentHistoryImporter._extract_antigravity_data(s_dir, transcript_path)
+            except Exception:
+                stats["sessions_failed"] += 1
+                logger.exception("Failed to parse Antigravity session %s", s_dir)
                 continue
-
-            project_name, workspace_path = _infer_project_name(paths, exchanges)
-            if not project_name:
-                continue
-            grouped.setdefault(project_name, []).append(
-                (session_id, s_dir, exchanges, artifacts, workspace_path)
-            )
-
-        updated_projects = 0
-        for project_name, sess_list in grouped.items():
-            sess_chronological = list(reversed(sess_list))
-            all_exchanges: List[Tuple[str, str, List[str]]] = []
-            all_artifacts: List[Path] = []
-            workspace_path = ""
-
-            for _, _, ex_list, arts, ws_path in sess_chronological:
-                all_exchanges.extend(ex_list)
-                all_artifacts.extend(arts)
-                if ws_path and not workspace_path:
-                    workspace_path = ws_path
-
-            core_plan = _build_project_core_plan(
-                project_name=project_name,
-                app_label="Antigravity",
-                workspace_path=workspace_path,
-                artifacts=all_artifacts,
-                exchanges=all_exchanges,
-            )
-
-            existing = store.get_by_project_name("antigravity", project_name)
-            if existing:
-                existing.name = project_name
-                existing.project_name = project_name
-                existing.sun_title = project_name
-                _merge_or_populate_system(
-                    existing, core_plan, workspace_path, all_exchanges, all_artifacts
-                )
-            else:
-                system = SolarSystem(
-                    name=project_name,
-                    project_name=project_name,
-                    sun_title=project_name,
-                    core_plan=core_plan,
-                    source="antigravity",
-                    source_id=f"antigravity:{_tr_lower(project_name)}",
-                    workspace_path=workspace_path,
-                )
-                _populate_clean_semantic_planets(system, all_exchanges, all_artifacts)
-                store.add_system(system)
-
-            updated_projects += 1
-
-        return updated_projects
+            stats["sessions_parsed"] += 1
+            sessions.append(data)
+        return AgentHistoryImporter._import_sessions(store, "antigravity", "Antigravity", sessions, stats)
 
     @staticmethod
-    def _extract_antigravity_data(
-        session_dir: Path, transcript_path: Path
-    ) -> Tuple[List[Tuple[str, str, List[str]]], List[str], List[Path]]:
-        try:
-            raw_content = transcript_path.read_text(encoding="utf-8", errors="replace")
-            lines = raw_content.splitlines()
-        except Exception:
-            return [], [], []
+    def _extract_antigravity_data(session_dir: Path, transcript_path: Path) -> SessionData:
+        data = SessionData(session_id=session_dir.name, mtime=_safe_mtime(transcript_path), log_path=str(transcript_path))
+        current: Optional[Exchange] = None
 
-        exchanges: List[Tuple[str, str, List[str]]] = []
-        paths: List[str] = []
-        current_user = ""
-        current_ai = ""
-        current_tools: List[str] = []
-
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                step = json.loads(line)
-            except Exception:
-                continue
-
+        for step in _iter_jsonl(transcript_path):
+            _note_entry_time(data, step)
             step_type = step.get("type", "")
             content = step.get("content", "") or ""
-
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
             if step_type == "USER_INPUT":
                 cleaned = _clean_user_request(content)
                 if cleaned:
-                    if current_user:
-                        exchanges.append((current_user, current_ai, current_tools))
-                    current_user = cleaned
-                    current_ai = ""
-                    current_tools = []
-
+                    if current is not None:
+                        data.exchanges.append(current)
+                    current = Exchange(user=cleaned)
             elif step_type == "PLANNER_RESPONSE":
+                if current is None:
+                    current = Exchange(user="")
                 if content.strip():
-                    current_ai = content.strip()
+                    current.ai = (current.ai + "\n\n" + content.strip()).strip() if current.ai else content.strip()
                 for tc in step.get("tool_calls", []) or []:
-                    t_name = tc.get("name", "tool")
+                    if not isinstance(tc, dict):
+                        continue
+                    t_name = str(tc.get("name", "tool"))
                     args = tc.get("args", {}) or {}
-                    for k in ("Path", "Directory", "CommandLine", "SearchPath"):
-                        val = str(args.get(k, "")).strip("\"")
-                        if val:
-                            paths.append(val)
-                    summary = (
-                        str(args.get("toolSummary", "")).strip("\"")
-                        or str(args.get("Path", "")).strip("\"")
-                        or str(args.get("query", "")).strip("\"")
-                    )
-                    current_tools.append(f"{t_name}: {summary}".strip(": "))
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except ValueError:
+                            args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    file_like, hints = _paths_from_args(args)
+                    edited = bool(_EDIT_TOOL_RE.search(t_name))
+                    for p in file_like:
+                        current.files.append((p, edited))
+                    data.tool_paths.extend(file_like + hints)
+                    summary = str(args.get("toolSummary", "")).strip('"') or (file_like[0] if file_like else "") or str(args.get("query", "")).strip('"')
+                    current.tools.append(f"{t_name}: {summary}".strip(": "))
+        if current is not None and (current.user or current.tools):
+            data.exchanges.append(current)
+        data.exchanges = [ex for ex in data.exchanges if ex.user or ex.tools]
+        try:
+            data.artifacts = sorted(f for f in session_dir.glob("*.md") if f.is_file() and not f.name.startswith("."))
+        except OSError:
+            data.artifacts = []
+        return data
 
-        if current_user:
-            exchanges.append((current_user, current_ai, current_tools))
-
-        artifacts = [
-            f for f in session_dir.glob("*.md") if f.is_file() and not f.name.startswith(".")
-        ]
-        return exchanges, paths, artifacts
-
+    # ---- Codex ----------------------------------------------------------
     @staticmethod
     def scan_codex(store: GalaxyStore, max_sessions: int = 60) -> int:
         """Scans local OpenAI Codex sessions (~/.codex/sessions and archived_sessions)."""
+        stats = _new_stats("codex")
         codex_dir = Path.home() / ".codex"
         if not codex_dir.exists():
             return 0
@@ -1120,247 +1407,253 @@ class AgentHistoryImporter:
         thread_names: Dict[str, str] = {}
         index_path = codex_dir / "session_index.jsonl"
         if index_path.exists():
-            try:
-                for ln in index_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if not ln.strip():
-                        continue
-                    item = json.loads(ln)
-                    sid = str(item.get("id", ""))
-                    tname = str(item.get("thread_name", "")).strip()
-                    if sid and tname:
-                        thread_names[sid] = tname
-            except Exception:
-                pass
+            for item in _iter_jsonl(index_path):
+                sid = str(item.get("id", ""))
+                tname = str(item.get("thread_name", "")).strip()
+                if sid and tname:
+                    thread_names[sid] = tname
 
         rollout_files: List[Path] = []
         for subdir_name in ("sessions", "archived_sessions"):
             s_dir = codex_dir / subdir_name
             if s_dir.exists():
-                rollout_files.extend(s_dir.rglob("*.jsonl"))
+                try:
+                    rollout_files.extend(p for p in s_dir.rglob("*.jsonl") if p.is_file())
+                except OSError:
+                    pass
+        rollout_files.sort(key=_safe_mtime, reverse=True)
 
-        rollout_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-
-        grouped: Dict[str, List[Tuple[str, List[Tuple[str, str, List[str]]], str]]] = {}
-
+        sessions: List[SessionData] = []
         for r_file in rollout_files[:max_sessions]:
-            session_id, cwd, exchanges = AgentHistoryImporter._parse_codex_rollout(r_file)
-            if not exchanges and not cwd:
+            stats["sessions_found"] += 1
+            try:
+                data = AgentHistoryImporter._parse_codex_rollout(r_file)
+            except Exception:
+                stats["sessions_failed"] += 1
+                logger.exception("Failed to parse Codex rollout %s", r_file)
                 continue
-
-            thread_hint = thread_names.get(session_id, "")
-            paths = [cwd] if cwd else []
-            project_name, ws_path = _infer_project_name(paths, exchanges, fallback_hint=thread_hint)
-            if not project_name:
-                continue
-            grouped.setdefault(project_name, []).append((session_id, exchanges, ws_path or cwd))
-
-        updated_projects = 0
-        for project_name, sess_list in grouped.items():
-            sess_chronological = list(reversed(sess_list))
-            all_exchanges: List[Tuple[str, str, List[str]]] = []
-            workspace_path = ""
-
-            for _, ex_list, ws_path in sess_chronological:
-                all_exchanges.extend(ex_list)
-                if ws_path and not workspace_path:
-                    workspace_path = ws_path
-
-            core_plan = _build_project_core_plan(
-                project_name=project_name,
-                app_label="OpenAI Codex",
-                workspace_path=workspace_path,
-                artifacts=[],
-                exchanges=all_exchanges,
-            )
-
-            existing = store.get_by_project_name("codex", project_name)
-            if existing:
-                existing.name = project_name
-                existing.project_name = project_name
-                existing.sun_title = project_name
-                _merge_or_populate_system(
-                    existing, core_plan, workspace_path, all_exchanges
-                )
-            else:
-                system = SolarSystem(
-                    name=project_name,
-                    project_name=project_name,
-                    sun_title=project_name,
-                    core_plan=core_plan,
-                    source="codex",
-                    source_id=f"codex:{_tr_lower(project_name)}",
-                    workspace_path=workspace_path,
-                )
-                _populate_clean_semantic_planets(system, all_exchanges)
-                store.add_system(system)
-
-            updated_projects += 1
-
-        return updated_projects
+            data.title = thread_names.get(data.session_id, "")
+            stats["sessions_parsed"] += 1
+            sessions.append(data)
+        return AgentHistoryImporter._import_sessions(store, "codex", "OpenAI Codex", sessions, stats)
 
     @staticmethod
-    def _parse_codex_rollout(file_path: Path) -> Tuple[str, str, List[Tuple[str, str, List[str]]]]:
-        try:
-            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return "", "", []
-
-        session_id = file_path.stem
-        cwd = ""
-        exchanges: List[Tuple[str, str, List[str]]] = []
-        current_user = ""
-        current_ai = ""
-        current_tools: List[str] = []
-
-        for line in lines:
-            if not line.strip():
-                continue
+    def _codex_tool_files(name: str, raw_args: object, cwd: str) -> Tuple[List[Tuple[str, bool]], List[str]]:
+        files: List[Tuple[str, bool]] = []
+        hints: List[str] = []
+        args: object = raw_args
+        if isinstance(raw_args, str):
             try:
-                obj = json.loads(line)
-            except Exception:
-                continue
+                args = json.loads(raw_args)
+            except ValueError:
+                args = raw_args
+        patch_texts: List[str] = []
+        workdir = cwd
+        if isinstance(args, str):
+            if "*** Begin Patch" in args:
+                patch_texts.append(args)
+        elif isinstance(args, dict):
+            workdir = str(args.get("workdir") or args.get("working_directory") or args.get("cwd") or cwd)
+            if workdir and workdir != cwd:
+                hints.append(workdir)
+            cmd = args.get("command") or args.get("cmd")
+            cmd_text = " ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd or "")
+            if "*** Begin Patch" in cmd_text:
+                patch_texts.append(cmd_text)
+            elif cmd_text:
+                hints.extend(_extract_paths_from_text(cmd_text))
+            for key in ("input", "patch"):
+                if isinstance(args.get(key), str) and "*** Begin Patch" in args[key]:
+                    patch_texts.append(args[key])
+            file_like, more = _paths_from_args(
+                {k: v for k, v in args.items() if k not in ("command", "cmd", "workdir", "working_directory", "cwd")}
+            )
+            edited = bool(_EDIT_TOOL_RE.search(name))
+            files.extend((_join_path(workdir, p), edited) for p in file_like)
+            hints.extend(more)
+        for text in patch_texts:
+            for m in list(_PATCH_FILE_RE.finditer(text)) + list(_PATCH_MOVE_RE.finditer(text)):
+                files.append((_join_path(workdir, m.group(1).strip()), True))
+        return files, hints
 
+    @staticmethod
+    def _parse_codex_rollout(file_path: Path) -> SessionData:
+        data = SessionData(session_id=file_path.stem, mtime=_safe_mtime(file_path), log_path=str(file_path))
+        current: Optional[Exchange] = None
+
+        for obj in _iter_jsonl(file_path):
+            _note_entry_time(data, obj)
             obj_type = obj.get("type", "")
             payload = obj.get("payload", {}) or {}
-
+            if not isinstance(payload, dict):
+                continue
             if obj_type == "session_meta":
-                session_id = str(payload.get("session_id") or payload.get("id") or session_id)
-                cwd = str(payload.get("cwd") or "")
+                data.session_id = str(payload.get("session_id") or payload.get("id") or data.session_id)
+                data.cwd = data.cwd or str(payload.get("cwd") or "")
                 roots = payload.get("runtime_workspace_roots") or []
-                if roots and not cwd:
-                    cwd = str(roots[0])
-
+                if roots and not data.cwd:
+                    data.cwd = str(roots[0])
+            elif obj_type == "turn_context":
+                if not data.cwd and payload.get("cwd"):
+                    data.cwd = str(payload["cwd"])
             elif obj_type == "response_item":
                 p_type = payload.get("type", "")
                 if p_type == "message":
                     role = payload.get("role", "")
-                    content_items = payload.get("content") or []
-                    text_parts = [
-                        str(c.get("text", ""))
-                        for c in content_items
-                        if isinstance(c, dict) and c.get("text")
-                    ]
+                    text_parts = [str(c.get("text", "")) for c in (payload.get("content") or []) if isinstance(c, dict) and c.get("text")]
                     full_text = "\n".join(text_parts).strip()
-
-                    if "The following is the Codex agent history" in full_text:
+                    if not full_text or "The following is the Codex agent history" in full_text:
                         continue
-
                     if role == "user":
                         cleaned = _clean_user_request(full_text)
-                        if cleaned and not cleaned.startswith("<"):
-                            if current_user:
-                                exchanges.append((current_user, current_ai, current_tools))
-                            current_user = cleaned
-                            current_ai = ""
-                            current_tools = []
-                    elif role == "assistant" and full_text:
-                        current_ai = full_text
+                        if cleaned and not cleaned.startswith("<") and not cleaned.lower().startswith("# agents.md instructions"):
+                            if current is not None:
+                                data.exchanges.append(current)
+                            current = Exchange(user=cleaned)
+                    elif role == "assistant":
+                        if current is None:
+                            current = Exchange(user="")
+                        current.ai = (current.ai + "\n\n" + full_text).strip() if current.ai else full_text
+                elif p_type in {"function_call", "custom_tool_call", "local_shell_call"}:
+                    if current is None:
+                        current = Exchange(user="")
+                    fn_name = str(payload.get("name") or p_type)
+                    raw = payload.get("arguments")
+                    if raw is None:
+                        raw = payload.get("input")
+                    if raw is None and isinstance(payload.get("action"), dict):
+                        raw = payload["action"]
+                    files, hints = AgentHistoryImporter._codex_tool_files(fn_name, raw, data.cwd)
+                    current.tools.append(fn_name)
+                    current.files.extend(files)
+                    data.tool_paths.extend([p for p, _ in files] + hints)
+        if current is not None:
+            data.exchanges.append(current)
+        data.exchanges = [ex for ex in data.exchanges if ex.user or ex.tools]
+        return data
 
-                elif p_type in {"function_call", "custom_tool_call"}:
-                    fn_name = str(payload.get("name", "tool"))
-                    current_tools.append(fn_name)
-
-        if current_user:
-            exchanges.append((current_user, current_ai, current_tools))
-
-        return session_id, cwd, exchanges
+    # ---- Claude Code ----------------------------------------------------
+    @staticmethod
+    def _is_subagent_file(path: Path) -> bool:
+        return path.name.startswith("agent-") or "subagents" in path.parts
 
     @staticmethod
     def scan_claude_code(store: GalaxyStore, max_sessions: int = 12) -> int:
-        """Scans local Claude Code project histories (~/.claude/projects) and merges by project name."""
+        """Scans local Claude Code project histories (~/.claude/projects) and merges by project root."""
+        stats = _new_stats("claude_code")
         claude_dir = Path.home() / ".claude" / "projects"
         if not claude_dir.exists():
             return 0
+        try:
+            jsonl_files = [p for p in claude_dir.rglob("*.jsonl") if p.is_file() and not AgentHistoryImporter._is_subagent_file(p)]
+        except OSError:
+            jsonl_files = []
+        jsonl_files.sort(key=_safe_mtime, reverse=True)
 
-        jsonl_files = list(claude_dir.rglob("*.jsonl"))
-        jsonl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-
-        grouped: Dict[str, List[Tuple[List[Tuple[str, str, List[str]]], str]]] = {}
-
+        sessions: List[SessionData] = []
         for j_file in jsonl_files[:max_sessions]:
+            stats["sessions_found"] += 1
             try:
-                lines = j_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                data = AgentHistoryImporter._parse_claude_session(j_file)
             except Exception:
+                stats["sessions_failed"] += 1
+                logger.exception("Failed to parse Claude Code session %s", j_file)
                 continue
+            if not data.cwd:
+                data.cwd = AgentHistoryImporter._decode_claude_project_dir(j_file.parent.name)
+            stats["sessions_parsed"] += 1
+            sessions.append(data)
+        return AgentHistoryImporter._import_sessions(store, "claude_code", "Claude Code", sessions, stats)
 
-            exchanges: List[Tuple[str, str, List[str]]] = []
-            cwd = ""
-            current_u = ""
-            current_a = ""
+    @staticmethod
+    def _decode_claude_project_dir(dir_name: str) -> str:
+        """Best-effort decoding of a Claude Code project folder name (cwd with separators
+        replaced by dashes). Only used when no `cwd` field exists, and only accepted if
+        the decoded path exists on this machine (the encoding is lossy)."""
+        m = re.match(r"^([A-Za-z])--(.*)$", dir_name)
+        if m:
+            cand = f"{m.group(1)}:\\" + m.group(2).replace("-", "\\")
+        elif dir_name.startswith("-"):
+            cand = "/" + dir_name[1:].replace("-", "/")
+        else:
+            return ""
+        return cand if _exists_locally(cand) else ""
 
-            for line in lines[:120]:
-                try:
-                    item = json.loads(line)
-                except Exception:
+    @staticmethod
+    def _parse_claude_session(path: Path) -> SessionData:
+        data = SessionData(session_id=path.stem, mtime=_safe_mtime(path), log_path=str(path))
+        current: Optional[Exchange] = None
+        cwd_counter: Counter = Counter()
+
+        for item in _iter_jsonl(path):
+            if item.get("isSidechain") is True:
+                continue
+            _note_entry_time(data, item)
+            etype = item.get("type")
+            if etype == "summary":
+                if item.get("summary") and not data.title:
+                    data.title = str(item["summary"]).strip()[:120]
+                continue
+            if etype not in ("user", "assistant"):
+                continue
+            if item.get("cwd"):
+                cwd_counter[str(item["cwd"])] += 1
+            if item.get("isMeta") is True:
+                continue
+            msg = item.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or etype
+            content = msg.get("content")
+
+            if role == "user":
+                texts: List[str] = []
+                if isinstance(content, str):
+                    texts = [content]
+                elif isinstance(content, list):
+                    if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                        continue  # tool output turn, not a user request
+                    texts = [str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                text = "\n".join(t for t in texts if t).strip()
+                if not text or text.startswith(("<command-", "<local-command", "Caveat:", "[Request interrupted")):
                     continue
-                if item.get("cwd") and not cwd:
-                    cwd = str(item.get("cwd"))
-                msg = item.get("message", {}) or {}
-                role = msg.get("role") or item.get("type")
-                content = msg.get("content") or item.get("display") or ""
-                if isinstance(content, list):
-                    content = " ".join(
-                        c.get("text", "") for c in content if isinstance(c, dict)
-                    )
-                if role == "user" and isinstance(content, str) and content.strip():
-                    cleaned = _clean_user_request(content)
-                    if cleaned:
-                        if current_u:
-                            exchanges.append((current_u, current_a, []))
-                        current_u = cleaned
-                        current_a = ""
-                elif role == "assistant" and isinstance(content, str) and content.strip():
-                    current_a = content.strip()
-
-            if current_u:
-                exchanges.append((current_u, current_a, []))
-            if not exchanges:
-                continue
-
-            paths = [cwd] if cwd else [j_file.parent.name]
-            project_name, ws_path = _infer_project_name(paths, exchanges)
-            if not project_name:
-                continue
-            grouped.setdefault(project_name, []).append((exchanges, ws_path or cwd))
-
-        updated_projects = 0
-        for project_name, sess_list in grouped.items():
-            all_exchanges: List[Tuple[str, str, List[str]]] = []
-            workspace_path = ""
-            for ex_list, ws_path in reversed(sess_list):
-                all_exchanges.extend(ex_list)
-                if ws_path and not workspace_path:
-                    workspace_path = ws_path
-
-            core_plan = _build_project_core_plan(
-                project_name=project_name,
-                app_label="Claude Code",
-                workspace_path=workspace_path,
-                artifacts=[],
-                exchanges=all_exchanges,
-            )
-
-            existing = store.get_by_project_name("claude_code", project_name)
-            if existing:
-                existing.name = project_name
-                existing.project_name = project_name
-                existing.sun_title = project_name
-                _merge_or_populate_system(
-                    existing, core_plan, workspace_path, all_exchanges
-                )
-            else:
-                system = SolarSystem(
-                    name=project_name,
-                    project_name=project_name,
-                    sun_title=project_name,
-                    core_plan=core_plan,
-                    source="claude_code",
-                    source_id=f"claude_code:{_tr_lower(project_name)}",
-                    workspace_path=workspace_path,
-                )
-                _populate_clean_semantic_planets(system, all_exchanges)
-                store.add_system(system)
-
-            updated_projects += 1
-
-        return updated_projects
+                cleaned = _clean_user_request(text)
+                if not cleaned:
+                    continue
+                if current is not None:
+                    data.exchanges.append(current)
+                current = Exchange(user=cleaned)
+            elif role == "assistant":
+                if current is None:
+                    current = Exchange(user="")
+                blocks = content if isinstance(content, list) else [{"type": "text", "text": content}] if isinstance(content, str) else []
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and b.get("text"):
+                        txt = str(b["text"]).strip()
+                        if len(current.ai) < 20_000:
+                            current.ai = (current.ai + "\n\n" + txt).strip() if current.ai else txt
+                    elif b.get("type") == "tool_use":
+                        t_name = str(b.get("name", "tool"))
+                        inp = b.get("input") or {}
+                        current.tools.append(t_name)
+                        if not isinstance(inp, dict):
+                            continue
+                        edited = bool(_EDIT_TOOL_RE.search(t_name))
+                        for k in ("file_path", "notebook_path"):
+                            if isinstance(inp.get(k), str) and inp[k].strip():
+                                p = _clean_path_str(inp[k])
+                                current.files.append((p, edited))
+                                data.tool_paths.append(p)
+                        if isinstance(inp.get("path"), str) and inp["path"].strip():
+                            p = _clean_path_str(inp["path"])
+                            data.tool_paths.append(p)
+                            if edited:
+                                current.files.append((p, True))
+        if current is not None:
+            data.exchanges.append(current)
+        data.exchanges = [ex for ex in data.exchanges if ex.user or ex.tools]
+        if cwd_counter:
+            data.cwd = cwd_counter.most_common(1)[0][0]
+        return data

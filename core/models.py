@@ -5,7 +5,11 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
+import shutil
+import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -147,6 +151,18 @@ class SatelliteNode:
     file_path: str = ""
     is_user_modified: bool = False
     created_at: str = field(default_factory=current_timestamp)
+    # --- Structured facts filled by the code importers (all optional) ---------
+    # What this sub-component is: "function", "class", "method", "constants",
+    # "file", "package" (external library), "session", "document" or "".
+    kind: str = ""
+    # Declaration as found in source, e.g. "def odak_modu(aktif: bool) -> str".
+    signature: str = ""
+    # 1-based line number of the definition in `file_path` (0 = unknown).
+    line: int = 0
+    # Resolved call relations to other sub-components of the same project, as
+    # "<module title>::<sub-component title>" references (e.g. "mikrofon.py::dinle_ve_yaz()").
+    calls: List[str] = field(default_factory=list)
+    called_by: List[str] = field(default_factory=list)
 
     @property
     def orbit_angle(self) -> float:
@@ -200,6 +216,20 @@ class PlanetNode:
     angle: float = 0.0
     orbit_speed: float = 0.12
     is_user_modified: bool = False
+    # What this module stands for: "file" (one source file), "dir" (a directory /
+    # package), "layer" (a layer group), "history" (agent session history),
+    # "external" (third-party libraries the project uses), or ""
+    # (hand-made / unknown). Set by the importers; older files load with "".
+    kind: str = ""
+    # Path of the file or directory this module represents (empty if none).
+    file_path: str = ""
+    # Optional description written by a local LLM (Ollama). Never contains nodes
+    # or links, only prose about what the importers found. Importers keep it
+    # across re-scans for modules with the same title.
+    ai_summary: str = ""
+    # True for the module where the program starts (e.g. the file with the
+    # `if __name__ == "__main__"` block, `main.py`, the package.json "main").
+    is_entry: bool = False
     satellites: List[SatelliteNode] = field(default_factory=list)
     created_at: str = field(default_factory=current_timestamp)
 
@@ -300,6 +330,33 @@ class SolarSystem:
     galaxy_y: float = 0.0
     is_user_modified: bool = False
     ollama_enhanced: bool = False
+    # What the project is FOR, in one to three plain sentences (not its structure).
+    purpose: str = ""
+    # Where `purpose` came from: "user" (typed by the user; never overwritten),
+    # "ai" (a local-LLM suggestion the user accepted), "readme" (taken from the
+    # project's own description), or "" (unknown yet).
+    purpose_source: str = ""
+    # Compact, human-readable evidence the importers collected about what the
+    # project does (description lines, header comments, user-facing strings,
+    # capabilities implied by libraries, first session requests). Shown as
+    # "based on" and used as the only input when the LLM writes `purpose`.
+    purpose_evidence: str = ""
+    # A sentence the local LLM suggested from `purpose_evidence`. Never the purpose: it is
+    # shown as "Suggested" until the user accepts it (then it becomes `purpose` with
+    # source "ai"), edits it (source "user") or dismisses it. Only kept while the purpose
+    # is empty or "ai" (see `connectors.purpose_suggestion`).
+    purpose_suggestion: str = ""
+    # `purpose_evidence.evidence_key` of the evidence the suggestion was made from.
+    purpose_suggestion_key: str = ""
+    # Evidence key at the time the user dismissed a suggestion: no automatic suggestion
+    # is made again until the evidence changes (a manual request still is).
+    purpose_dismissed_key: str = ""
+    # What the project IS, as one short fact line ("Python desktop app · PySide6 ·
+    # entry: main.py"). Deterministic: built by `connectors.codebase_importer.identity_line`
+    # from the code analysis only, never by the AI, never a purpose, not user-editable,
+    # and recomputed (replaced) on every scan. "" = not scanned yet (the UI then derives a
+    # best-effort value from the stored analysis facts, see `stored_identity`).
+    identity: str = ""
     planets: List[PlanetNode] = field(default_factory=list)
     links: List[PlanetLink] = field(default_factory=list)
     notes: List[CanvasNote] = field(default_factory=list)
@@ -780,7 +837,10 @@ class SolarSystem:
         )
         self.tour_steps = [p.id for p in ordered_planets]
 
-        if not self.links and len(ordered_planets) > 1:
+        # Default layer links are a drawing aid for hand-made (manual) projects only.
+        # Imported projects (codebase / agent sources) must show nothing but links
+        # that were actually found in the source, so none are invented for them.
+        if self.source == "manual" and not self.links and len(ordered_planets) > 1:
             by_layer: Dict[str, List[PlanetNode]] = {}
             for p in self.planets:
                 by_layer.setdefault(p.layer, []).append(p)
@@ -810,20 +870,93 @@ class SolarSystem:
                     )
 
 
+# Top-level `format_version` of galaxy.json. Files without it (or older) are migrated on
+# load (`GalaxyStore.load`, in memory); `save` always writes the current value.
+#   2: an AI-written purpose is only a suggestion (`SolarSystem.purpose_suggestion`); old
+#      `purpose_source == "ai"` purposes become suggestions (they were never accepted).
+GALAXY_FORMAT_VERSION = 2
+
+
+def file_format_version(raw: object) -> int:
+    """The `format_version` of a parsed galaxy.json payload (0 when missing / invalid)."""
+    value = raw.get("format_version") if isinstance(raw, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Writes `text` (UTF-8) to `path` atomically.
+
+    The data goes to a temp file in the same directory, is flushed and fsynced,
+    then moved over the target with `os.replace`, so readers (e.g. the GUI file
+    watcher) see either the old or the new file, never a half-written one.
+    On Windows `os.replace` can briefly fail with PermissionError while another
+    process holds the target open, so it is retried a few times.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(10):
+            try:
+                os.replace(tmp_name, str(path))
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 class GalaxyStore:
-    """Persists all projects in a local JSON file (`data/galaxy.json`)."""
+    """Persists all projects in a local JSON file (`data/galaxy.json`).
+
+    Concurrency model: the GUI and the CLI bridge (`connectors.live_bridge`) may
+    both write the same file. Writes are atomic (`atomic_write_text`). There is
+    no file lock; instead short-lived writers (the CLI bridge) construct a fresh
+    store right before applying their single mutation and call
+    `reload_if_changed()` just before saving, re-applying the mutation if
+    another process changed the file in the meantime. A small race window
+    between that check and the final `os.replace` remains.
+
+    Load failures never destroy data: an unreadable file is copied to a
+    timestamped backup (`backup_path`) on first load, `load_error` describes the
+    problem, and a failed reload keeps the in-memory projects untouched.
+    """
 
     def __init__(self, storage_path: Optional[Path] = None) -> None:
         base_dir = Path(__file__).resolve().parent.parent
-        self.data_dir = base_dir / "data"
+        if storage_path:
+            self.file_path = Path(storage_path)
+            self.data_dir = self.file_path.parent
+        else:
+            self.data_dir = base_dir / "data"
+            self.file_path = self.data_dir / "galaxy.json"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.file_path = Path(storage_path) if storage_path else (self.data_dir / "galaxy.json")
         self.settings_path = self.data_dir / "settings.json"
         self.systems: List[SolarSystem] = []
         self.last_written_text: str = ""
+        self.load_error: Optional[str] = None
+        self.backup_path: Optional[Path] = None
+        self._loaded_once = False
+        self._write_blocked_reason: Optional[str] = None
         self._undo_stack: List[str] = []
         self._redo_stack: List[str] = []
         self.max_history = 30
+        # `format_version` of the file as last loaded (0 = written before versioning) and
+        # how many old "ai" purposes that load turned into suggestions.
+        self.loaded_format_version: int = GALAXY_FORMAT_VERSION
+        self.migrated_purposes: int = 0
         self.load()
 
     # ------------------------------------------------------------------
@@ -849,7 +982,7 @@ class GalaxyStore:
                 data = {}
         data[key] = value
         try:
-            self.settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(self.settings_path, json.dumps(data, ensure_ascii=False, indent=2))
         except Exception:
             pass
 
@@ -925,6 +1058,9 @@ class GalaxyStore:
 
             for note in other.notes:
                 primary.notes.append(copy.deepcopy(note))
+
+            if not (primary.identity or "").strip() and (other.identity or "").strip():
+                primary.identity = other.identity
 
             if other in self.systems:
                 self.systems.remove(other)
@@ -1069,25 +1205,101 @@ class GalaxyStore:
         sys_obj.rebuild_links_and_tour()
         return sys_obj
 
-    def load(self) -> None:
+    def load(self) -> bool:
+        """Loads projects from disk. Returns True on success.
+
+        - Missing file on first load: creates the starter project and saves it.
+        - Missing file on reload: keeps the in-memory projects, returns False.
+        - Unreadable / invalid file on first load: copies it to
+          `galaxy.corrupt-YYYYmmdd-HHMMSS.json` (`self.backup_path`), then falls
+          back to the starter project. If the backup cannot be written, the
+          starter project is still shown but `save()` refuses to overwrite the file.
+        - Unreadable / invalid file on reload: keeps the in-memory projects and
+          does not touch the disk.
+        `self.load_error` holds a readable message on failure, None on success.
+        """
+        first_load = not self._loaded_once
+
         if not self.file_path.exists():
+            if not first_load:
+                self.load_error = f"Project file not found: {self.file_path}"
+                return False
+            self._loaded_once = True
+            self.load_error = None
             self.systems = [self._create_starter_system()]
             self.recalculate_galaxy_sectors()
             self.save()
-            return
+            return True
 
         try:
-            text = self.file_path.read_text(encoding="utf-8")
+            raw_bytes = self.file_path.read_bytes()
+            text = raw_bytes.decode("utf-8")
             raw = json.loads(text)
+            if not isinstance(raw, dict) or not isinstance(raw.get("systems", []), list):
+                raise ValueError("top-level JSON must be an object with a 'systems' list")
             loaded = [
                 s for s in (self._parse_system(d) for d in raw.get("systems", [])) if s is not None
             ]
-            self.systems = loaded if loaded else [self._create_starter_system()]
-            self.recalculate_galaxy_sectors()
-            self.last_written_text = text
-        except Exception:
+        except Exception as exc:
+            message = f"Could not read project file {self.file_path}: {type(exc).__name__}: {exc}"
+            if not first_load:
+                # Live reload path: keep what we have, leave the file alone.
+                self.load_error = message
+                return False
+            self._loaded_once = True
+            self.backup_path = None
+            try:
+                self.backup_path = self._write_corrupt_backup()
+                self.load_error = f"{message}. A backup was saved to {self.backup_path}."
+            except Exception as backup_exc:
+                self._write_blocked_reason = (
+                    f"{message}. Backup failed ({backup_exc}); refusing to overwrite the file."
+                )
+                self.load_error = self._write_blocked_reason
             self.systems = [self._create_starter_system()]
             self.recalculate_galaxy_sectors()
+            return False
+
+        if first_load and not loaded:
+            loaded = [self._create_starter_system()]
+        self.loaded_format_version = file_format_version(raw)
+        self.migrated_purposes = 0
+        if self.loaded_format_version < GALAXY_FORMAT_VERSION:
+            # In memory only; the next normal save writes the current format_version.
+            from connectors.purpose_suggestion import migrate_ai_purposes_to_suggestions
+
+            self.migrated_purposes = migrate_ai_purposes_to_suggestions(loaded)
+        self._loaded_once = True
+        self.systems = loaded
+        self.recalculate_galaxy_sectors()
+        # Normalize line endings like Path.read_text so is_own_write() comparisons match.
+        self.last_written_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        self.load_error = None
+        self._write_blocked_reason = None
+        return True
+
+    def _write_corrupt_backup(self) -> Path:
+        """Copies the current (unreadable) file to a timestamped backup next to it."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stem, suffix = self.file_path.stem, self.file_path.suffix or ".json"
+        candidate = self.file_path.with_name(f"{stem}.corrupt-{stamp}{suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = self.file_path.with_name(f"{stem}.corrupt-{stamp}-{counter}{suffix}")
+            counter += 1
+        shutil.copy2(str(self.file_path), str(candidate))
+        return candidate
+
+    def reload_if_changed(self) -> bool:
+        """Reloads from disk if the file differs from what this store last loaded or wrote.
+
+        Returns True if a reload happened and succeeded. Used by the CLI bridge
+        right before saving, so it re-applies its mutation instead of
+        overwriting changes another process (e.g. the GUI) just made.
+        """
+        if self.is_own_write():
+            return False
+        return self.load()
 
     def recalculate_galaxy_sectors(self) -> None:
         """Positions project cards into a non-overlapping 2-column dashboard layout grouped by source."""
@@ -1140,14 +1352,17 @@ class GalaxyStore:
         )
 
     def save(self) -> None:
+        if self._write_blocked_reason:
+            raise RuntimeError(self._write_blocked_reason)
         self.recalculate_galaxy_sectors()
         payload = {
+            "format_version": GALAXY_FORMAT_VERSION,
             "updated_at": current_timestamp(),
             "systems": [asdict(s) for s in self.systems],
         }
         text = json.dumps(payload, ensure_ascii=False, indent=2)
+        atomic_write_text(self.file_path, text)
         self.last_written_text = text
-        self.file_path.write_text(text, encoding="utf-8")
 
     def is_own_write(self) -> bool:
         """Checks if the file on disk matches the last content written by Helios itself."""
@@ -1341,10 +1556,10 @@ class GalaxyStore:
             title="Noise-Filtered Session Importer",
             content=(
                 "WHAT IT DOES:\n"
-                "Strips trivial operational commands and system tags from session logs, importing only "
-                "meaningful modules and technical decisions.\n\n"
+                "Strips trivial operational commands and system tags from session logs, so sessions "
+                "can be listed as work history next to a map built from the real code.\n\n"
                 "HOW IT WORKS & TECHNICAL DETAILS:\n"
-                "• Cleans transcripts with `_clean_user_request()` and `_is_noise_or_trivial_message()`, mapping features to architectural layers.\n\n"
+                "• Finds each session's project folder, builds the map from the code in it, and lists sessions in one Work History module.\n\n"
                 "RELATED FILE: `connectors/agent_importer.py`"
             ),
             visual_tag="code",

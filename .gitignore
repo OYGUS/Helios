@@ -25,3 +25,11 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Test / temp artifacts
+.pytest_cache/
+*.tmp
+
+# Working files from AI assistants (screenshots and archives contain local project data)
+Claude outputs/
+.claude/

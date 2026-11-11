@@ -1,92 +1,55 @@
 # Helios
 
-**Helios** is a desktop application that visualizes project plans, session histories from AI coding tools (Antigravity, OpenAI Codex, Claude Code), and local codebases as an interactive architectural knowledge graph.
+Helios is a desktop app that turns your local code projects and your AI coding sessions into an interactive map of how each project is built.
 
----
+![Helios](assets/screenshot.png)
 
-## Core Architecture Model
+## What it does
 
-1. **Project Core (Core Plan):**
-   The central node of each project holds its primary goal, domain summary, and core architectural rules. It remains pinned at the top of the right-hand inspector panel so the big picture is never lost.
-2. **Architectural Modules (Layers):**
-   Layer nodes orbiting the Project Core (`Architecture & Planning`, `UI & Visualization`, `Core & Data Model`, `Integration & Bridges`, `Testing & Validation`, `Research & Analysis`, `Documentation`).
-3. **Sub-Components:**
-   Source files, classes, functions, and technical design decisions orbiting each module.
-4. **Data Flow & Dependency Links:**
-   Directed connections illustrating import relationships, API calls, and execution flow between modules.
-5. **Project & Source Overview:**
-   A top-level board organizing projects either unified across tools or grouped by source (`Antigravity`, `OpenAI Codex`, `Claude Code`, `Codebase Analysis`, `Personal Projects`).
+- **Maps a codebase.** Point Helios at a folder and it draws the project's modules and the links between them. Links come only from imports it really found in the code (Python, JavaScript/TypeScript, PHP and HTML). Nothing is guessed.
+- **Imports your AI coding history.** Helios can read the local session logs of Antigravity, OpenAI Codex and Claude Code, find the project folders you worked in, and map the real code in each one. Your sessions are listed in a separate "Work History" module.
+- **Shows what each project is for.** Above the map you see a short purpose line, taken from the project's own description (for example the README). Below it is a "what it is" line built from the code analysis, such as `Python desktop app · PySide6 · entry: main.py`. You can always write your own purpose.
+- **Optional local AI (Ollama).** If you have Ollama, it can write short descriptions and suggest a purpose. A suggestion is only a suggestion: you can accept, edit or dismiss it. The AI only writes text; it never adds or removes anything on the map.
+- **Lets you draw and edit.** Add modules, components, links and notes on the canvas. Undo and redo work with `Ctrl+Z` / `Ctrl+Y`.
+- **Copies a ready prompt.** "Copy prompt" turns a project's overview, modules and links into text you can paste into a coding agent.
 
----
+## Getting started
 
-## Key Features
-
-- **AI Agent & Data Source Integrations:**
-  Automatically detects installed AI coding assistants on your machine, filters out terminal noise from session logs, and transforms project history into clean architectural maps.
-- **Deterministic Local Codebase (AST) Analysis:**
-  Scans Python (`ast`), TypeScript/JavaScript, Go, Rust, C#, and Markdown files to automatically extract architectural layers, classes, functions, and cross-module dependencies.
-- **Optional Local LLM (Ollama) Verification:**
-  Operates completely standalone with its deterministic analysis engine. Optionally connects to local Ollama models to verify and enrich project summaries.
-- **Interactive Drawing & Diagramming Tools:**
-  Draw new modules, sub-components, directed data flow arrows, and freeform architecture notes directly on the canvas with full undo/redo (`Ctrl+Z` / `Ctrl+Y`) history.
-- **One-Click AI Context (Prompt) Export:**
-  Compiles the Project Core plan, modules, sub-components, and data flow rules into a structured Markdown prompt ready to paste into any coding agent.
-- **Live CLI Bridge:**
-  Coding agents can update the live map in real time via `python -m connectors.live_bridge` commands.
-
----
-
-## Installation & Usage
-
-### Requirements
-- Python 3.10+
-- `PySide6-Essentials`
+You need Python 3.10 or newer.
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-On Windows, you can also launch the application directly with `run_helios.bat`.
+On Windows you can also double-click `run_helios.bat`.
 
----
+Helios runs from this folder; it is not installed as a package. To map your own repositories, put them in the `projects/` folder and scan it from the app, or add any folder from inside the app.
 
-## Analyzing Local Projects (`projects/`)
+## Optional: Ollama
 
-Place any local repositories you want to inspect inside the `projects/` directory and use **+ Add Project -> Scan 'projects/' Directory** inside the app to map them in one click.
+Helios works fully without AI. If [Ollama](https://ollama.com) and a model are installed on your computer, Helios finds them on its own. You can pick the model or turn Ollama off in Settings.
 
-You can also analyze any directory from the command line:
+## Your data
+
+Everything stays on your computer. Your projects are saved in the `data/` folder (`data/galaxy.json`), which is git-ignored, so it is never committed. Helios reads AI session logs only from your own machine.
+
+## For developers
 
 ```bash
-python -m connectors.live_bridge analyze-folder --path "./my-project"
+pip install -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen python -m pytest tests -q
 ```
 
----
+On Windows PowerShell, run `$env:QT_QPA_PLATFORM = "offscreen"` first. Tests never write to the repo's `data/` folder.
 
-## Repository Structure
+See [CLAUDE.md](CLAUDE.md) for the architecture, coding rules and the live CLI bridge (`python -m connectors.live_bridge`), which lets coding agents update a running Helios app.
 
-```text
-Helios/
-├── main.py                     # Application entry point
-├── requirements.txt            # Python dependencies
-├── run_helios.bat              # Windows launcher script
-├── LICENSE                     # MIT License
-├── CLAUDE.md                   # Claude Code live integration guide
-├── core/
-│   └── models.py               # Data models, layer definitions, and GalaxyStore
-├── connectors/
-│   ├── agent_importer.py       # Antigravity, Codex, and Claude Code session analyzer
-│   ├── codebase_importer.py    # AST-based local codebase and directory analyzer
-│   ├── ollama_enhancer.py      # Optional local Ollama verification enhancer
-│   └── live_bridge.py          # Live CLI / AI agent bridge
-├── ui/
-│   ├── main_window.py          # Main window, integrations view, and inspector panel
-│   └── space_canvas.py         # QGraphicsScene-based interactive architecture canvas
-└── projects/                   # Directory for local projects to analyze (.gitkeep)
-```
+## Known limitations
 
----
+- Dependency links are drawn only for Python, JavaScript/TypeScript, PHP and HTML. Other languages get modules and components but no links.
+- The Antigravity, Codex and Claude Code importers read local file formats that those tools may change at any time.
 
 ## License
 
-Distributed under the [MIT License](LICENSE).
+MIT. See [LICENSE](LICENSE).

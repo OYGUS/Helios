@@ -1,0 +1,17 @@
+# Metadata and tool config only. Helios is run from a repo checkout (python main.py); it is not a pip-installable package.
+[project]
+name = "helios-architecture-graph"
+version = "0.2.0"
+description = "Visual architecture studio and interactive knowledge graph for local codebases and AI coding agents."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["PySide6-Essentials>=6.6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/OYGUS/Helios"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

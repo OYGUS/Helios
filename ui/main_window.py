@@ -11,15 +11,19 @@ Features:
 
 from __future__ import annotations
 
+import copy
+import inspect
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QFileSystemWatcher, QPoint, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QFileSystemWatcher, QPoint, QSize, Qt, QTimer, Slot
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -33,8 +37,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTextEdit,
@@ -44,9 +50,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from connectors import agent_importer
+from connectors import codebase_importer as codebase_importer_module
 from connectors.agent_importer import AgentDetector, AgentHistoryImporter
 from connectors.codebase_importer import CodebaseImporter
+from connectors.purpose_evidence import assess_purpose_evidence
+from connectors.purpose_suggestion import (
+    PROTECTED_SOURCES as PROTECTED_PURPOSE_SOURCES,
+    accept_purpose_suggestion,
+    check_suggestion_text,
+    classify_purpose_failure,
+    current_evidence_key,
+    dismiss_purpose_suggestion,
+    needs_auto_suggestion,
+    pending_suggestion,
+    purpose_failure_detail,
+    save_edited_purpose,
+    set_purpose_suggestion,
+)
 from connectors.ollama_enhancer import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_SETTING_KEY,
+    SUPPORTED_LANGUAGES,
     OllamaEnhancer,
     OllamaEnhanceWorker,
     OllamaPullWorker,
@@ -63,92 +88,125 @@ from core.models import (
     SolarSystem,
     get_source_meta,
 )
-from ui.space_canvas import SpaceCanvasView
+from ui import theme
+from ui.inspector import (
+    ClampedLabel,
+    ElidedLabel,
+    EvidenceViewer,
+    ExpandableText,
+    PurposeEditor,
+    KeyValueGrid,
+    PlainRow,
+    RowButton,
+    SkippedFoldersDialog,
+    chip,
+    clear_layout,
+    section_label,
+    skipped_folder_summary,
+    strip_repeated_text,
+)
+from ui.space_canvas import SpaceCanvasView, planet_caption, resolve_component_ref
+from ui.workers import (
+    HELIOS_ROOT,
+    AgentSyncWorker,
+    CanvasPaintFreezer,
+    CodebaseScanWorker,
+    ModelDetectWorker,
+    OllamaServerCheckWorker,
+    StoreWorker,
+    find_worker_host,
+    start_store_worker,
+)
+
+
+def _weak_purpose_evidence_tip(system) -> str:
+    """Why the AI is not asked for a purpose suggestion ("" when the evidence is strong)."""
+    evidence = str(getattr(system, "purpose_evidence", "") or "")
+    name = str(getattr(system, "project_name", "") or getattr(system, "name", "") or "")
+    strength = assess_purpose_evidence(evidence, name)
+    if strength.strong:
+        return ""
+    return (f"Too little is known about what this project is for, so the AI is not asked "
+            f"(it would guess). {strength.explanation}. Write the purpose yourself, or add a README.")
+
+
+def _project_search_text(system) -> str:
+    """Lower-cased purpose + identity line of a project (what the search box matches)."""
+    purpose = str(getattr(system, "purpose", "") or "")
+    try:
+        identity = codebase_importer_module.stored_identity(system)
+    except Exception:
+        identity = ""
+    return f"{purpose}\n{identity}".lower()
+
+
+def _sync_core_plan_purpose(system) -> None:
+    """Keeps the `Purpose:` line of the generated overview text in step with
+    `system.purpose` (the importer owns that text's format)."""
+    try:
+        from connectors.codebase_importer import update_core_plan_purpose
+        update_core_plan_purpose(system)
+    except Exception:  # an older overview text without the line: nothing to update
+        pass
 
 
 class NewProjectStudioDialog(QDialog):
-    """Wizard for designing a new project from scratch or from a built-in architecture template."""
+    """Wizard for designing a new project from scratch or from a built-in template."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("New Project — Helios")
-        self.setMinimumSize(520, 420)
-        self.setStyleSheet(
-            """
-            QDialog {
-                background-color: #0D1014;
-                color: #E5E7EB;
-            }
-            QLabel {
-                color: #D1D5DB;
-                font-size: 12px;
-                font-weight: 600;
-            }
-            QLineEdit, QTextEdit, QComboBox {
-                background-color: #14181F;
-                color: #F3F4F6;
-                border: 1px solid #262C36;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 12px;
-            }
-            QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
-                border: 1px solid #3B82F6;
-            }
-            """
-        )
+        self.setWindowTitle("New project — Helios")
+        self.setMinimumSize(520, 440)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(6)
 
-        header = QLabel("Create New Project")
-        header.setStyleSheet("color: #F9FAFB; font-size: 15px; font-weight: 700;")
-        layout.addWidget(header)
-
-        sub = QLabel(
-            "Define your project's purpose and pick a starting architecture template. Once created, "
-            "you can add modules, sub-components, and data flows using the canvas drawing tools."
+        layout.addWidget(theme.label("Design a new project", "title"))
+        sub = theme.label(
+            "Give it a name and pick a starting layout. You can add modules, components and links "
+            "with the drawing tools afterwards.",
+            "secondary",
+            wrap=True,
         )
-        sub.setWordWrap(True)
-        sub.setStyleSheet("color: #9CA3AF; font-size: 11.5px; font-weight: 400;")
         layout.addWidget(sub)
+        layout.addSpacing(10)
 
-        layout.addWidget(QLabel("Project Name"))
+        layout.addWidget(theme.label("Name", "caption"))
         self.edit_name = QLineEdit()
-        self.edit_name.setPlaceholderText("e.g., E-Commerce Platform, Analytics Engine...")
+        self.edit_name.setPlaceholderText("e.g. Analytics engine")
         layout.addWidget(self.edit_name)
+        layout.addSpacing(6)
 
-        layout.addWidget(QLabel("Starting Template"))
+        layout.addWidget(theme.label("Starting layout", "caption"))
         self.combo_template = QComboBox()
-        self.combo_template.addItem("Blank Canvas (Design from Scratch)", "blank")
-        self.combo_template.addItem("Full-Stack Application (UI → API → Database)", "fullstack")
-        self.combo_template.addItem("AI Agent System (Input → LLM → Tools → Memory)", "ai_agent")
-        self.combo_template.addItem("Data & Automation Pipeline (Ingestion → Processing → Output)", "data_pipeline")
+        self.combo_template.addItem("Blank canvas", "blank")
+        self.combo_template.addItem("Full-stack app (UI → API → database)", "fullstack")
+        self.combo_template.addItem("AI agent (input → LLM → tools → memory)", "ai_agent")
+        self.combo_template.addItem("Data pipeline (ingest → process → output)", "data_pipeline")
         layout.addWidget(self.combo_template)
+        layout.addSpacing(6)
 
-        layout.addWidget(QLabel("Project Purpose & Overview"))
+        layout.addWidget(theme.label("What it does", "caption"))
         self.edit_purpose = QTextEdit()
-        self.edit_purpose.setPlaceholderText(
-            "Core workflow, problem solved, and high-level module structure..."
-        )
+        self.edit_purpose.setPlaceholderText("The problem it solves and how it is put together…")
         self.edit_purpose.setMinimumHeight(90)
         layout.addWidget(self.edit_purpose)
+        layout.addSpacing(6)
 
-        layout.addWidget(QLabel("Tech Stack (Optional)"))
+        layout.addWidget(theme.label("Tech stack (optional)", "caption"))
         self.edit_stack = QLineEdit()
-        self.edit_stack.setPlaceholderText("e.g., Python, FastAPI, Next.js, PostgreSQL...")
+        self.edit_stack.setPlaceholderText("e.g. Python, FastAPI, PostgreSQL")
         layout.addWidget(self.edit_stack)
 
+        layout.addStretch(1)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
-        btn_create = QPushButton("Create Project")
+        btn_create = QPushButton("Create project")
         btn_create.setObjectName("PrimaryBtn")
-        btn_create.setStyleSheet(
-            "background-color: #2563EB; color: #FFFFFF; border: 1px solid #3B82F6; padding: 6px 16px; font-weight: 600;"
-        )
+        btn_create.setDefault(True)
         btn_create.clicked.connect(self.accept)
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_create)
@@ -200,186 +258,76 @@ class IntegrationCardWidget(QFrame):
         main_layout.setContentsMargins(16, 12, 16, 12)
         main_layout.setSpacing(14)
 
-        # 1. Left: Monogram Badge (36x36)
-        badge_box = QFrame()
-        badge_box.setFixedSize(36, 36)
-        badge_box.setStyleSheet(
-            """
-            QFrame {
-                background-color: #181C23;
-                border: 1px solid #262C36;
-                border-radius: 7px;
-            }
-            """
-        )
-        b_lay = QVBoxLayout(badge_box)
-        b_lay.setContentsMargins(0, 0, 0, 0)
+        # Left: monogram badge in the (softened) source colour
         lbl_code = QLabel(str(self.info.get("icon", "AI")))
+        lbl_code.setObjectName("Monogram")
+        lbl_code.setFixedSize(36, 36)
         lbl_code.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_code.setStyleSheet(
-            f"color: {self.color}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; background: transparent; border: none;"
-        )
-        b_lay.addWidget(lbl_code)
-        main_layout.addWidget(badge_box)
+        # Per-source colour: the only inline colour here, derived from the theme mapping.
+        lbl_code.setStyleSheet(f"color: {theme.soft_color_hex(self.color)};")
+        main_layout.addWidget(lbl_code)
 
-        # 2. Middle: Title, Status, and Description
+        # Middle: name, status and description
         mid_box = QVBoxLayout()
-        mid_box.setSpacing(3)
+        mid_box.setSpacing(2)
         mid_box.setContentsMargins(0, 0, 0, 0)
-
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
-
         lbl_name = QLabel(str(self.info.get("name", "Source")))
-        lbl_name.setStyleSheet("color: #F3F4F6; font-size: 13px; font-weight: 600; background: transparent; border: none;")
+        lbl_name.setProperty("role", "body")
+        name_font = lbl_name.font()
+        name_font.setWeight(QFont.Weight.DemiBold)
+        lbl_name.setFont(name_font)
         top_row.addWidget(lbl_name)
-
-        is_detected = bool(self.info.get("detected", False))
-        dot_color = "#10B981" if is_detected else "#6B7280"
-        self.lbl_status = QLabel(f"•  {self.info.get('status', '')}")
-        self.lbl_status.setStyleSheet(f"color: {dot_color if is_detected else '#6B7280'}; font-size: 11.5px; font-weight: 500; background: transparent; border: none;")
+        self.lbl_status = QLabel("")
         top_row.addWidget(self.lbl_status)
-
         path_hint = str(self.info.get("path", ""))
         if path_hint and path_hint != "None":
-            lbl_path = QLabel(f"({path_hint})")
-            lbl_path.setStyleSheet("color: #6B7280; font-size: 11px; font-family: Consolas, monospace; background: transparent; border: none;")
+            lbl_path = theme.label(path_hint, "mono")
+            lbl_path.setToolTip(path_hint)
             top_row.addWidget(lbl_path)
-
         top_row.addStretch(1)
         mid_box.addLayout(top_row)
-
         desc_text = str(self.info.get("description", ""))
-        lbl_desc = QLabel(desc_text)
-        lbl_desc.setWordWrap(True)
-        lbl_desc.setStyleSheet("color: #8B949E; font-size: 11.5px; background: transparent; border: none;")
-        mid_box.addWidget(lbl_desc)
-
+        if desc_text:
+            mid_box.addWidget(theme.label(desc_text, "caption", wrap=True))
         main_layout.addLayout(mid_box, stretch=1)
 
-        # 3. Right: Ollama Model Selector (if available) + Connect Toggle Button
+        # Right: Ollama model selector (if available) + connect toggle
         right_row = QHBoxLayout()
         right_row.setSpacing(8)
         right_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
         if self.tool_key == "ollama":
             models = self.info.get("models", [])
             if models:
                 self.combo_ollama = QComboBox()
-                self.combo_ollama.setFixedWidth(125)
-                self.combo_ollama.setFixedHeight(28)
-                self.combo_ollama.setStyleSheet(
-                    "background-color: #161A22; color: #E5E7EB; border: 1px solid #282F3D; border-radius: 5px; font-size: 11px; padding: 2px 8px;"
-                )
+                self.combo_ollama.setMinimumWidth(150)
                 for m in models:
                     self.combo_ollama.addItem(m, m)
                 right_row.addWidget(self.combo_ollama)
-
         self.btn_toggle = QPushButton()
-        self.btn_toggle.setFixedSize(88, 28)
+        self.btn_toggle.setObjectName("ToggleBtn")
         self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle.clicked.connect(lambda: self.set_connected(not self._is_connected))
         right_row.addWidget(self.btn_toggle)
-
         main_layout.addLayout(right_row)
 
     def _apply_state(self) -> None:
         is_detected = bool(self.info.get("detected", False))
-        dot_color = "#10B981" if is_detected else "#6B7280"
         if hasattr(self, "lbl_status"):
             self.lbl_status.setText(f"•  {self.info.get('status', '')}")
-            self.lbl_status.setStyleSheet(
-                f"color: {dot_color}; font-size: 11.5px; font-weight: 500; background: transparent; border: none;"
-            )
-
+            theme.set_role(self.lbl_status, "ok" if is_detected else "muted")
         if self.is_locked:
-            self.setStyleSheet(
-                """
-                QFrame#IntegrationCard {
-                    background-color: #12151B;
-                    border: 1px solid #222731;
-                    border-radius: 8px;
-                }
-                """
-            )
-            self.btn_toggle.setText("Built-in")
-            self.btn_toggle.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: #181C24;
-                    color: #9CA3AF;
-                    border: 1px solid #262C36;
-                    border-radius: 5px;
-                    font-size: 11px;
-                    font-weight: 500;
-                }
-                """
-            )
-            return
-
-        if self._is_connected:
-            self.setStyleSheet(
-                """
-                QFrame#IntegrationCard {
-                    background-color: #141820;
-                    border: 1px solid #2D3748;
-                    border-radius: 8px;
-                }
-                QFrame#IntegrationCard:hover {
-                    background-color: #171C26;
-                    border: 1px solid #3B82F6;
-                }
-                """
-            )
-            self.btn_toggle.setText("Connected")
-            self.btn_toggle.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: #1E3A8A;
-                    color: #93C5FD;
-                    border: 1px solid #2563EB;
-                    border-radius: 5px;
-                    font-size: 11.5px;
-                    font-weight: 600;
-                }
-                QPushButton:hover {
-                    background-color: #1D4ED8;
-                    color: #FFFFFF;
-                }
-                """
-            )
+            state, text = "locked", "Built-in"
+        elif self._is_connected:
+            state, text = "on", "Connected"
         else:
-            self.setStyleSheet(
-                """
-                QFrame#IntegrationCard {
-                    background-color: #11141A;
-                    border: 1px solid #1E232D;
-                    border-radius: 8px;
-                }
-                QFrame#IntegrationCard:hover {
-                    background-color: #151921;
-                    border: 1px solid #2B3240;
-                }
-                """
-            )
-            self.btn_toggle.setText("Connect")
-            self.btn_toggle.setStyleSheet(
-                """
-                QPushButton {
-                    background-color: #181C24;
-                    color: #9CA3AF;
-                    border: 1px solid #262C36;
-                    border-radius: 5px;
-                    font-size: 11.5px;
-                    font-weight: 500;
-                }
-                QPushButton:hover {
-                    background-color: #212631;
-                    color: #F3F4F6;
-                    border-color: #374151;
-                }
-                """
-            )
+            state, text = "off", "Connect"
+        self.setProperty("state", state)
+        self.btn_toggle.setProperty("state", state)
+        self.btn_toggle.setText(text)
+        theme.repolish(self)
+        theme.repolish(self.btn_toggle)
 
 
 class AIConnectionsView(QWidget):
@@ -399,41 +347,6 @@ class AIConnectionsView(QWidget):
         self.cards: Dict[str, IntegrationCardWidget] = {}
         self.detected_tools = AgentDetector.detect_all()
         self.setObjectName("AIConnectionsView")
-        self.setStyleSheet(
-            """
-            QWidget#AIConnectionsView {
-                background-color: #0B0E14;
-            }
-            QLabel {
-                color: #D1D5DB;
-            }
-            QComboBox {
-                background-color: #141820;
-                color: #F3F4F6;
-                border: 1px solid #262C36;
-                border-radius: 5px;
-                padding: 4px 10px;
-                font-size: 11.5px;
-            }
-            QPushButton {
-                background-color: #161B22;
-                color: #E5E7EB;
-                border: 1px solid #262C36;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 500;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #1F242D;
-                border-color: #374151;
-            }
-            QScrollArea {
-                background: transparent;
-                border: none;
-            }
-            """
-        )
         self._build_ui()
 
     def refresh_state(self) -> None:
@@ -462,32 +375,34 @@ class AIConnectionsView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        scroll.viewport().setAutoFillBackground(False)
 
         container = QWidget()
+        container.setObjectName("Transparent")
         container.setMaximumWidth(820)
         c_layout = QVBoxLayout(container)
         c_layout.setContentsMargins(32, 32, 32, 32)
-        c_layout.setSpacing(18)
+        c_layout.setSpacing(16)
 
         # 1. Top Header Row
         header_row = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(4)
 
-        title_lbl = QLabel("Integrations & Data Sources")
-        title_lbl.setStyleSheet("color: #F9FAFB; font-size: 18px; font-weight: 600;")
+        title_lbl = theme.label("Integrations", "title")
         title_col.addWidget(title_lbl)
 
-        sub_lbl = QLabel(
-            "Select which local AI coding session histories and local LLM models to include in the architecture graph."
+        sub_lbl = theme.label(
+            "Choose which AI coding tools Helios reads project folders from, and whether a local "
+            "Ollama model writes module descriptions.",
+            "secondary",
+            wrap=True,
         )
-        sub_lbl.setStyleSheet("color: #8B949E; font-size: 12px;")
         title_col.addWidget(sub_lbl)
         header_row.addLayout(title_col, stretch=1)
 
         ready_count = sum(1 for v in self.detected_tools.values() if v.get("detected"))
-        self.lbl_stats = QLabel(f"{ready_count} sources detected")
-        self.lbl_stats.setStyleSheet("color: #8B949E; font-size: 12px;")
+        self.lbl_stats = theme.label(f"{ready_count} sources detected", "caption")
         header_row.addWidget(self.lbl_stats, alignment=Qt.AlignmentFlag.AlignTop)
 
         c_layout.addLayout(header_row)
@@ -526,20 +441,17 @@ class AIConnectionsView(QWidget):
 
         # 3. Bottom Options Bar
         opt_box = QFrame()
-        opt_box.setStyleSheet(
-            "background-color: #11141A; border: 1px solid #1E232D; border-radius: 8px; padding: 10px 14px;"
-        )
+        opt_box.setObjectName("Card")
         opt_lay = QHBoxLayout(opt_box)
-        opt_lay.setContentsMargins(4, 2, 4, 2)
+        opt_lay.setContentsMargins(16, 10, 16, 10)
+        opt_lay.setSpacing(10)
 
-        self.chk_reset_projects = QCheckBox("Clear existing graph and rebuild from selected sources")
-        self.chk_reset_projects.setStyleSheet("font-size: 12px; color: #D1D5DB;")
+        self.chk_reset_projects = QCheckBox("Clear the map and rebuild it from the selected sources")
         self.chk_reset_projects.setChecked(not bool(self.store.get_setting("onboarding_completed", False)))
         opt_lay.addWidget(self.chk_reset_projects)
         opt_lay.addStretch(1)
 
-        lbl_limit = QLabel("Session limit:")
-        lbl_limit.setStyleSheet("color: #8B949E; font-size: 12px;")
+        lbl_limit = theme.label("Sessions to read", "caption")
         opt_lay.addWidget(lbl_limit)
 
         self.combo_max_sessions = QComboBox()
@@ -548,40 +460,22 @@ class AIConnectionsView(QWidget):
         opt_lay.addWidget(self.combo_max_sessions)
         c_layout.addWidget(opt_box)
 
-        # Status Message
-        self.lbl_status = QLabel("")
-        self.lbl_status.setStyleSheet("color: #93C5FD; font-size: 12px;")
+        # Status message
+        self.lbl_status = theme.label("", "warn", wrap=True)
         self.lbl_status.setVisible(False)
         c_layout.addWidget(self.lbl_status)
 
-        # 4. Action Buttons
+        # Action buttons
         btn_row = QHBoxLayout()
-        btn_back = QPushButton("Back to Canvas")
-        btn_back.setFixedHeight(34)
+        btn_back = QPushButton("Back to the map")
         btn_back.clicked.connect(self._on_skip)
         btn_row.addWidget(btn_back)
+        self.btn_back = btn_back
 
         btn_row.addStretch(1)
 
-        self.btn_connect = QPushButton("Save & Apply")
+        self.btn_connect = QPushButton("Save and apply")
         self.btn_connect.setObjectName("PrimaryBtn")
-        self.btn_connect.setFixedHeight(34)
-        self.btn_connect.setStyleSheet(
-            """
-            QPushButton#PrimaryBtn {
-                background-color: #2563EB;
-                color: #FFFFFF;
-                border: 1px solid #3B82F6;
-                border-radius: 6px;
-                padding: 0 20px;
-                font-weight: 600;
-                font-size: 12px;
-            }
-            QPushButton#PrimaryBtn:hover {
-                background-color: #1D4ED8;
-            }
-            """
-        )
         self.btn_connect.clicked.connect(self._on_connect)
         btn_row.addWidget(self.btn_connect)
         c_layout.addLayout(btn_row)
@@ -606,15 +500,10 @@ class AIConnectionsView(QWidget):
     def _on_connect(self) -> None:
         selected = [k for k, card in self.cards.items() if card.is_connected()]
         if not selected:
-            QMessageBox.warning(self, "No Source Selected", "Please connect at least one AI source or the Codebase engine.")
+            QMessageBox.warning(self, "No source selected", "Please connect at least one AI source or the Codebase engine.")
             return
 
-        self.btn_connect.setEnabled(False)
-        self.lbl_status.setVisible(True)
-        self.lbl_status.setText("Scanning selected AI session histories and building the architecture graph...")
-        QApplication.processEvents()
-
-        # Save Ollama preference and ensure service is running if selected
+        # Save Ollama preference (the service itself is started by the worker if selected)
         if "ollama" in selected:
             self.store.set_setting("disable_ollama", False)
             ollama_card = self.cards.get("ollama")
@@ -622,55 +511,102 @@ class AIConnectionsView(QWidget):
                 chosen_m = ollama_card.combo_ollama.currentText()
                 if chosen_m:
                     self.store.set_setting("selected_ollama_model", chosen_m)
-            OllamaEnhancer.ensure_server_running()
         else:
             self.store.set_setting("disable_ollama", True)
 
-        if self.chk_reset_projects.isChecked():
-            self.store.clear_all()
+        busy_text = "Scanning selected AI session histories and building the architecture graph..."
+        worker = AgentSyncWorker(
+            self.store,
+            selected,
+            max_sessions=self._get_max_sessions(),
+            start_ollama="ollama" in selected,
+            reset=self.chk_reset_projects.isChecked(),
+            analyze_helios="codebase" in selected,
+            helios_dir=HELIOS_ROOT,
+        )
+        self._pending_selected = list(selected)
+        self.set_busy(True, busy_text)
+        worker.progressText.connect(self.lbl_status.setText)
+        if not start_store_worker(self, worker, self._on_connect_finished, busy_text):
+            self._on_worker_rejected()
 
-        max_sess = self._get_max_sessions()
-        AgentHistoryImporter.scan_selected_sources(self.store, selected, max_sessions=max_sess)
+    def set_busy(self, busy: bool, text: str = "") -> None:
+        """Disables the integration controls while a background scan runs."""
+        for card in self.cards.values():
+            card.setEnabled(not busy)
+        for w in (self.chk_reset_projects, self.combo_max_sessions, self.btn_connect, self.btn_back):
+            w.setEnabled(not busy)
+        if busy:
+            self.lbl_status.setVisible(True)
+            self.lbl_status.setText(text)
+        else:
+            self.lbl_status.setVisible(False)
 
-        if "codebase" in selected:
-            helios_dir = Path(__file__).resolve().parent.parent
-            has_helios_code = any(
-                s.source == "codebase" and s.project_name.lower() == "helios"
-                for s in self.store.systems
-            )
-            if not has_helios_code:
-                try:
-                    CodebaseImporter.analyze_directory(helios_dir, self.store)
-                except Exception:
-                    pass
+    def _on_worker_rejected(self) -> None:
+        host = find_worker_host(self)
+        self.set_busy(bool(host is not None and host.is_store_busy()))
+        self.lbl_status.setVisible(True)
+        self.lbl_status.setText("Another scan is already running. Please wait for it to finish.")
 
+    def _host_status(self, text: str) -> None:
+        host = self.window()
+        lbl = getattr(host, "status_label", None)
+        if lbl is not None:
+            lbl.setText(text)
+
+    def _on_connect_finished(self, ok: bool, msg: str, payload: object) -> None:
+        self.set_busy(False)
+        if not ok:
+            self.lbl_status.setVisible(True)
+            self.lbl_status.setText(msg)
+            QMessageBox.warning(self, "Scan failed", msg)
+            return
+
+        selected = getattr(self, "_pending_selected", [])
         self.store.set_setting("connected_sources", selected)
         self.store.set_setting("onboarding_completed", True)
-        self.btn_connect.setEnabled(True)
-        self.lbl_status.setVisible(False)
 
         if self.on_finish:
             self.on_finish()
+        warnings = payload.get("warnings") if isinstance(payload, dict) else None
+        if warnings:
+            self._host_status("AI integrations updated. Warning: " + " ".join(str(w) for w in warnings))
 
     def _on_skip(self) -> None:
-        if self.chk_reset_projects.isChecked():
-            self.store.clear_all()
-        helios_dir = Path(__file__).resolve().parent.parent
+        reset = self.chk_reset_projects.isChecked()
         has_helios_code = any(
             s.source == "codebase" and s.project_name.lower() == "helios"
             for s in self.store.systems
         )
-        if not has_helios_code:
-            try:
-                CodebaseImporter.analyze_directory(helios_dir, self.store)
-            except Exception:
-                pass
+        if not reset and has_helios_code:
+            self._on_skip_finished(True, "", None)
+            return
+        busy_text = "Analyzing the Helios codebase..."
+        worker = AgentSyncWorker(
+            self.store,
+            [],
+            reset=reset,
+            analyze_helios=True,
+            helios_dir=HELIOS_ROOT,
+        )
+        self.set_busy(True, busy_text)
+        worker.progressText.connect(self.lbl_status.setText)
+        if not start_store_worker(self, worker, self._on_skip_finished, busy_text):
+            self._on_worker_rejected()
+
+    def _on_skip_finished(self, ok: bool, msg: str, payload: object) -> None:
+        self.set_busy(False)
         self.store.set_setting("connected_sources", ["codebase", "manual"])
         self.store.set_setting("onboarding_completed", True)
         if self.on_cancel:
             self.on_cancel()
         elif self.on_finish:
             self.on_finish()
+        warnings = payload.get("warnings") if isinstance(payload, dict) else None
+        if not ok:
+            self._host_status(msg)
+        elif warnings:
+            self._host_status("Warning: " + " ".join(str(w) for w in warnings))
 
 
 class AIConnectionsDialog(QDialog):
@@ -683,9 +619,8 @@ class AIConnectionsDialog(QDialog):
         is_first_run: bool = False,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Helios — AI & Data Source Integrations")
+        self.setWindowTitle("Integrations — Helios")
         self.resize(840, 720)
-        self.setStyleSheet("QDialog { background-color: #070B16; }")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.view = AIConnectionsView(
@@ -697,225 +632,397 @@ class AIConnectionsDialog(QDialog):
         lay.addWidget(self.view)
 
 
+# ----------------------------------------------------------------------------
+# Project purpose and ignored folders (settings helpers)
+# ----------------------------------------------------------------------------
+PURPOSE_SOURCE_TAGS: Dict[str, str] = {
+    "user": "Written by you",
+    "readme": "From the project's README",
+    "ai": "AI suggestion you accepted",
+}
+AUTO_PURPOSE_SETTING_KEY = "ollama_auto_purpose"
+IGNORED_FOLDERS_KEY = "ignored_folders"
+
+
+def normalize_folder(path: object) -> str:
+    """Absolute, normalised folder path as stored in the ``ignored_folders`` setting."""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+
+
+def _folder_key(path: str) -> str:
+    return os.path.normcase(normalize_folder(path)).rstrip("\\/")
+
+
+def ignored_folders(store: GalaxyStore) -> List[str]:
+    raw = store.get_setting(IGNORED_FOLDERS_KEY, [])
+    if not isinstance(raw, list):
+        return []
+    return [str(p) for p in raw if isinstance(p, str) and p.strip()]
+
+
+def add_ignored_folder(store: GalaxyStore, path: object) -> bool:
+    """Adds ``path`` to the ignore list; False if it was already there (or empty)."""
+    norm = normalize_folder(path)
+    if not norm:
+        return False
+    current = ignored_folders(store)
+    if any(_folder_key(p) == _folder_key(norm) for p in current):
+        return False
+    store.set_setting(IGNORED_FOLDERS_KEY, current + [norm])
+    return True
+
+
+def remove_ignored_folder(store: GalaxyStore, path: object) -> bool:
+    key = _folder_key(str(path or ""))
+    current = ignored_folders(store)
+    kept = [p for p in current if _folder_key(p) != key]
+    if len(kept) == len(current):
+        return False
+    store.set_setting(IGNORED_FOLDERS_KEY, kept)
+    return True
+
+
+def _covering_entries(store: GalaxyStore, path: object) -> List[str]:
+    """Ignore-list entries equal to ``path`` or containing it."""
+    key = _folder_key(str(path or ""))
+    if not key:
+        return []
+    out = []
+    for entry in ignored_folders(store):
+        base = _folder_key(entry)
+        if base and (key == base or key.startswith(base + os.sep)):
+            out.append(entry)
+    return out
+
+
+def folder_is_ignored(store: GalaxyStore, path: object) -> bool:
+    """Uses the importer's ``is_ignored_folder`` when it exists, plus the setting itself."""
+    fn = getattr(codebase_importer_module, "is_ignored_folder", None)
+    if callable(fn):
+        try:
+            if fn(store, path):
+                return True
+        except Exception:
+            pass
+    return bool(_covering_entries(store, path))
+
+
+class _ChoiceButton(QPushButton):
+    """A large, left-aligned choice: a title line and an explanation line."""
+
+    def __init__(self, title: str, explanation: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ChoiceBtn")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.choice_title = title
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 8, 14, 8)
+        lay.setSpacing(1)
+        t = theme.label(title, "body")
+        t.setStyleSheet("font-weight: 600;")
+        e = theme.label(explanation, "caption", wrap=True)
+        for w in (t, e):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            lay.addWidget(w)
+        self.setAccessibleName(title)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(58)
+
+    def text(self) -> str:  # tests / accessibility read the choice title
+        return self.choice_title
+
+
+class RemoveProjectDialog(QDialog):
+    """Asks how to remove a project: from Helios only, or also never import its folder again."""
+
+    REMOVE = "remove"
+    IGNORE = "ignore"
+
+    def __init__(self, system: SolarSystem, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.choice = ""
+        self.setWindowTitle("Remove project")
+        self.setMinimumWidth(460)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 20, 22, 18)
+        outer.setSpacing(10)
+        name = system.project_name or system.name
+        outer.addWidget(theme.label(f"Remove '{name}'?", "heading"))
+        folder = (system.workspace_path or "").strip()
+        if folder:
+            lbl = theme.label(folder, "mono", wrap=True)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        else:
+            lbl = theme.label("No folder is linked to this project.", "muted", wrap=True)
+        outer.addWidget(lbl)
+        outer.addSpacing(4)
+        self.btn_remove = _ChoiceButton(
+            "Remove from Helios",
+            "It may come back on the next sync if its folder is found again.",
+        )
+        self.btn_remove.clicked.connect(lambda: self._choose(self.REMOVE))
+        outer.addWidget(self.btn_remove)
+        self.btn_ignore: Optional[_ChoiceButton] = None
+        if folder:
+            self.btn_ignore = _ChoiceButton(
+                "Remove and never import this folder again",
+                "Scans skip this folder from now on. You can undo this in Settings › Ignored folders.",
+            )
+            self.btn_ignore.clicked.connect(lambda: self._choose(self.IGNORE))
+            outer.addWidget(self.btn_ignore)
+        outer.addWidget(theme.label("Ctrl+Z brings the project back.", "muted"))
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_cancel.setDefault(True)
+        row.addWidget(btn_cancel)
+        outer.addLayout(row)
+
+    def _choose(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+    @classmethod
+    def ask(cls, system: SolarSystem, parent: Optional[QWidget] = None) -> str:
+        """Shows the dialog modally; returns REMOVE, IGNORE or "" (cancelled)."""
+        dlg = cls(system, parent)
+        dlg.exec()
+        choice = dlg.choice
+        dlg.deleteLater()
+        return choice
+
+
 class HeliosSettingsDialog(QDialog):
-    """Helios System & Model Settings Dialog."""
+    """Settings: local Ollama model, the 'projects/' folder scan and duplicate merging."""
 
     def __init__(self, store: GalaxyStore, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("Helios — System & Model Settings")
-        self.setMinimumSize(620, 560)
-        self.setStyleSheet(
-            """
-            QDialog {
-                background-color: #0F141D;
-                color: #E2E8F0;
-            }
-            QLabel {
-                color: #CBD5E1;
-                font-size: 11.5px;
-            }
-            QLineEdit, QComboBox {
-                background-color: #161E2C;
-                color: #F8FAFC;
-                border: 1px solid #28354A;
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 12px;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #3B82F6;
-            }
-            QCheckBox {
-                color: #E2E8F0;
-                font-size: 11.5px;
-                font-weight: 600;
-            }
-            QPushButton {
-                background-color: #18202D;
-                color: #E2E8F0;
-                border: 1px solid #283347;
-                border-radius: 6px;
-                padding: 5px 10px;
-                font-weight: 600;
-                font-size: 11.5px;
-            }
-            QPushButton:hover {
-                background-color: #212B3C;
-                border-color: #384761;
-            }
-            QPushButton#PrimaryBtn {
-                background-color: #2563EB;
-                border: 1px solid #3B82F6;
-                color: #FFFFFF;
-            }
-            QPushButton#PrimaryBtn:hover {
-                background-color: #1D4ED8;
-            }
-            """
-        )
-
+        self.setWindowTitle("Settings — Helios")
+        self.setMinimumSize(600, 540)
         self._pull_worker: Optional[OllamaPullWorker] = None
         self._build_ui()
 
+    @staticmethod
+    def _card(title: str, text: str = "") -> "tuple[QFrame, QVBoxLayout]":
+        box = QFrame()
+        box.setObjectName("Card")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(8)
+        lay.addWidget(theme.label(title, "heading"))
+        if text:
+            lay.addWidget(theme.label(text, "secondary", wrap=True))
+        return box, lay
+
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 18, 22, 18)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.viewport().setAutoFillBackground(False)
+        body = QWidget()
+        body.setObjectName("Transparent")
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 20, 24, 12)
         layout.setSpacing(12)
 
-        title_lbl = QLabel("System & AI Settings")
-        title_lbl.setStyleSheet("color: #F8FAFC; font-size: 16px; font-weight: 700;")
-        layout.addWidget(title_lbl)
+        layout.addWidget(theme.label("Settings", "title"))
 
-        sub_lbl = QLabel(
-            "Manage local Ollama model selection, model downloads, batch project folder scanning, "
-            "and cross-source project deduplication from a single place."
+        # --- Local AI (Ollama) ---
+        box_ai, lay_ai = self._card(
+            "Local AI (Ollama)",
+            "An optional local model writes short module descriptions. The map itself always comes from your code.",
         )
-        sub_lbl.setWordWrap(True)
-        sub_lbl.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        layout.addWidget(sub_lbl)
-
-        # --- SECTION 1: Local AI & Ollama Model ---
-        box_ai = QFrame()
-        box_ai.setStyleSheet("background-color: #121824; border: 1px solid #222E42; border-radius: 8px; padding: 10px;")
-        lay_ai = QVBoxLayout(box_ai)
-        lay_ai.setSpacing(8)
-
-        lbl_ai_sec = QLabel("1. LOCAL AI MODEL SELECTION (OLLAMA)")
-        lbl_ai_sec.setStyleSheet("color: #60A5FA; font-weight: 700; font-size: 11.5px; border: none;")
-        lay_ai.addWidget(lbl_ai_sec)
-
         row_mod = QHBoxLayout()
-        row_mod.addWidget(QLabel("Active Model:"))
+        row_mod.setSpacing(8)
+        lbl_model = theme.label("Model", "caption")
+        lbl_model.setFixedWidth(130)
+        row_mod.addWidget(lbl_model)
         self.combo_model = QComboBox()
         self.combo_model.setMinimumWidth(220)
         self._refresh_models_list()
-        row_mod.addWidget(self.combo_model)
-        btn_refresh_models = QPushButton("Refresh Models")
-        btn_refresh_models.setToolTip("Rescan locally installed Ollama models")
+        row_mod.addWidget(self.combo_model, 1)
+        btn_refresh_models = QPushButton("Refresh")
+        btn_refresh_models.setToolTip("Look for installed Ollama models again")
         btn_refresh_models.clicked.connect(self._refresh_models_list)
         row_mod.addWidget(btn_refresh_models)
-        row_mod.addStretch(1)
         lay_ai.addLayout(row_mod)
 
-        self.chk_disable_ollama = QCheckBox("Run Without LLM (Use Built-in Deterministic Engine Only)")
+        row_lang = QHBoxLayout()
+        row_lang.setSpacing(8)
+        lbl_lang = theme.label("Description language", "caption")
+        lbl_lang.setFixedWidth(130)
+        row_lang.addWidget(lbl_lang)
+        self.combo_language = QComboBox()
+        self.combo_language.setToolTip("Language Ollama writes module and project descriptions in")
+        for lang in SUPPORTED_LANGUAGES:
+            self.combo_language.addItem(lang, lang)
+        saved_lang = str(self.store.get_setting(LANGUAGE_SETTING_KEY, DEFAULT_LANGUAGE) or DEFAULT_LANGUAGE)
+        if self.combo_language.findData(saved_lang) < 0:
+            self.combo_language.addItem(saved_lang, saved_lang)
+        self.combo_language.setCurrentIndex(self.combo_language.findData(saved_lang))
+        row_lang.addWidget(self.combo_language, 1)
+        lay_ai.addLayout(row_lang)
+
+        self.chk_disable_ollama = QCheckBox("Don't use Ollama (built-in analysis only)")
         self.chk_disable_ollama.setChecked(bool(self.store.get_setting("disable_ollama", False)))
         self.chk_disable_ollama.setToolTip(
-            "When checked, Ollama is never called; Helios runs 100% standalone using its deterministic code and session analyzer."
+            "When checked, Ollama is never called; Helios only uses its own code analysis."
         )
         lay_ai.addWidget(self.chk_disable_ollama)
 
-        lay_ai.addWidget(QLabel("Pull New Ollama Model:"))
-        row_pull = QHBoxLayout()
-        self.edit_pull = QLineEdit()
-        self.edit_pull.setPlaceholderText("e.g., qwen2.5-coder:3b, phi3.5:3.8b, deepseek-r1:1.5b...")
-        row_pull.addWidget(self.edit_pull, stretch=1)
+        self.chk_auto_purpose = QCheckBox("Suggest project descriptions automatically with Ollama")
+        self.chk_auto_purpose.setChecked(bool(self.store.get_setting(AUTO_PURPOSE_SETTING_KEY, True)))
+        self.chk_auto_purpose.setToolTip(
+            "After a scan, a project without a description gets a suggestion from the local model "
+            "(one request per project). It is shown as “Suggested” until you accept, edit or "
+            "dismiss it; a description you wrote yourself is never replaced."
+        )
+        lay_ai.addWidget(self.chk_auto_purpose)
 
-        self.btn_pull = QPushButton("Download & Install")
-        self.btn_pull.setStyleSheet("background-color: #1E3A8A; color: #93C5FD; border: 1px solid #3B82F6;")
+        lay_ai.addSpacing(4)
+        lay_ai.addWidget(theme.label("Download a model", "caption"))
+        row_pull = QHBoxLayout()
+        row_pull.setSpacing(8)
+        self.edit_pull = QLineEdit()
+        self.edit_pull.setPlaceholderText("e.g. qwen2.5-coder:3b")
+        row_pull.addWidget(self.edit_pull, stretch=1)
+        self.btn_pull = QPushButton("Download")
         self.btn_pull.clicked.connect(self._start_pull_model)
         row_pull.addWidget(self.btn_pull)
         lay_ai.addLayout(row_pull)
 
         row_sug = QHBoxLayout()
-        row_sug.addWidget(QLabel("Quick Suggestions:"))
+        row_sug.setSpacing(6)
+        row_sug.addWidget(theme.label("Suggestions", "muted"))
         for sug_name in ("qwen2.5-coder:3b", "phi3.5:3.8b", "deepseek-r1:1.5b"):
             s_btn = QPushButton(sug_name)
-            s_btn.setStyleSheet("font-size: 10.5px; padding: 2px 7px;")
+            s_btn.setObjectName("ChipBtn")
+            s_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             s_btn.clicked.connect(lambda chk=False, n=sug_name: self.edit_pull.setText(n))
             row_sug.addWidget(s_btn)
         row_sug.addStretch(1)
         lay_ai.addLayout(row_sug)
 
-        self.lbl_pull_status = QLabel("")
-        self.lbl_pull_status.setStyleSheet("color: #FDE047; font-size: 11px;")
+        self.lbl_pull_status = theme.label("", "warn", wrap=True)
         self.lbl_pull_status.setVisible(False)
         lay_ai.addWidget(self.lbl_pull_status)
-
         layout.addWidget(box_ai)
 
-        # --- SECTION 1.5: AI & Data Source Integrations ---
-        box_conn = QFrame()
-        box_conn.setStyleSheet("background-color: #121824; border: 1px solid #222E42; border-radius: 8px; padding: 10px;")
-        lay_conn = QHBoxLayout(box_conn)
-        lay_conn.setSpacing(12)
-        lbl_conn_desc = QLabel(
-            "<b>Data Sources & Integrations:</b> Configure which local tools (Antigravity, OpenAI Codex, Claude Code) "
-            "are connected to the graph and how session histories are imported."
+        # --- Integrations ---
+        box_conn, lay_conn = self._card(
+            "Integrations",
+            "Choose which AI coding tools (Antigravity, OpenAI Codex, Claude Code) Helios reads projects from.",
         )
-        lbl_conn_desc.setWordWrap(True)
-        lay_conn.addWidget(lbl_conn_desc, stretch=1)
-        btn_open_conn = QPushButton("Configure Integrations...")
+        row_conn = QHBoxLayout()
+        row_conn.addStretch(1)
+        btn_open_conn = QPushButton("Open integrations")
         btn_open_conn.clicked.connect(self._open_connections_wizard)
-        lay_conn.addWidget(btn_open_conn)
+        row_conn.addWidget(btn_open_conn)
+        lay_conn.addLayout(row_conn)
         layout.addWidget(box_conn)
 
-        # --- SECTION 2: Helios 'projects/' Directory Scanner ---
-        box_proj = QFrame()
-        box_proj.setStyleSheet("background-color: #121824; border: 1px solid #222E42; border-radius: 8px; padding: 10px;")
-        lay_proj = QVBoxLayout(box_proj)
-        lay_proj.setSpacing(8)
-
-        lbl_proj_sec = QLabel("2. SCAN PROJECTS FROM HELIOS 'projects/' DIRECTORY")
-        lbl_proj_sec.setStyleSheet("color: #34D399; font-weight: 700; font-size: 11.5px; border: none;")
-        lay_proj.addWidget(lbl_proj_sec)
-
+        # --- projects/ folder ---
         helios_proj_dir = CodebaseImporter.get_helios_projects_dir()
-        lay_proj.addWidget(
-            QLabel(
-                f"Helios only scans its dedicated <b>projects/</b> directory for batch local codebase imports.<br>"
-                f"Place any repositories you want to inspect inside this folder to map them in one click:<br>"
-                f"<span style='color: #60A5FA; font-family: monospace;'>{helios_proj_dir}</span>"
-            )
+        box_proj, lay_proj = self._card(
+            "The 'projects/' folder",
+            "Copy project folders here to map them all in one go.",
         )
-
+        lbl_dir = theme.label(str(helios_proj_dir), "mono", wrap=True)
+        lbl_dir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay_proj.addWidget(lbl_dir)
         row_dir = QHBoxLayout()
-        btn_open_folder = QPushButton("Open 'projects/' Folder")
+        row_dir.setSpacing(8)
+        row_dir.addStretch(1)
+        btn_open_folder = QPushButton("Open folder")
         btn_open_folder.clicked.connect(self._open_helios_projects_folder)
         row_dir.addWidget(btn_open_folder)
-
-        self.btn_scan_batch = QPushButton("Scan & Map Projects in Folder")
-        self.btn_scan_batch.setObjectName("PrimaryBtn")
+        self.btn_scan_batch = QPushButton("Scan folder")
         self.btn_scan_batch.clicked.connect(self._scan_helios_projects_folder)
         row_dir.addWidget(self.btn_scan_batch)
-        row_dir.addStretch(1)
         lay_proj.addLayout(row_dir)
-
         layout.addWidget(box_proj)
 
-        # --- SECTION 3: Merge Duplicate Projects & Modules ---
-        box_dedup = QFrame()
-        box_dedup.setStyleSheet("background-color: #121824; border: 1px solid #222E42; border-radius: 8px; padding: 10px;")
-        lay_dedup = QHBoxLayout(box_dedup)
-        lay_dedup.setSpacing(12)
-
-        lbl_dedup_desc = QLabel(
-            "<b>Merge Duplicate Projects & Modules:</b> Consolidates projects with the same name across different "
-            "sources (e.g., Antigravity and Claude / Codex) and deduplicates identical modules."
+        # --- duplicates ---
+        box_dedup, lay_dedup = self._card(
+            "Merge duplicates",
+            "Combines projects with the same name from different sources and removes identical modules.",
         )
-        lbl_dedup_desc.setWordWrap(True)
-        lay_dedup.addWidget(lbl_dedup_desc, stretch=1)
-
-        self.btn_dedup = QPushButton("Merge Duplicates")
-        self.btn_dedup.setToolTip("Merges identically named projects and duplicate module/component nodes")
+        row_dedup = QHBoxLayout()
+        row_dedup.addStretch(1)
+        self.btn_dedup = QPushButton("Merge duplicates")
+        self.btn_dedup.setToolTip("Merges projects with the same name and duplicate modules or components")
         self.btn_dedup.clicked.connect(self._run_deduplication)
-        lay_dedup.addWidget(self.btn_dedup)
-
+        row_dedup.addWidget(self.btn_dedup)
+        lay_dedup.addLayout(row_dedup)
         layout.addWidget(box_dedup)
 
+        # --- ignored folders ---
+        box_ign, lay_ign = self._card(
+            "Ignored folders",
+            "Folders you removed with \u201cnever import this folder again\u201d. Scans skip them.",
+        )
+        self.ignored_list_layout = QVBoxLayout()
+        self.ignored_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.ignored_list_layout.setSpacing(4)
+        lay_ign.addLayout(self.ignored_list_layout)
+        self._refresh_ignored_list()
+        layout.addWidget(box_ign)
         layout.addStretch(1)
-        row_actions = QHBoxLayout()
-        row_actions.addStretch(1)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(24, 10, 24, 18)
+        footer.addStretch(1)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.reject)
-        row_actions.addWidget(btn_close)
-
-        btn_save = QPushButton("Save Settings")
+        footer.addWidget(btn_close)
+        btn_save = QPushButton("Save settings")
         btn_save.setObjectName("PrimaryBtn")
-        btn_save.setStyleSheet("background-color: #2563EB; color: #FFFFFF; font-weight: 700; padding: 6px 18px;")
+        btn_save.setDefault(True)
         btn_save.clicked.connect(self._save_settings_and_close)
-        row_actions.addWidget(btn_save)
-        layout.addLayout(row_actions)
+        footer.addWidget(btn_save)
+        outer.addLayout(footer)
+
+    def _refresh_ignored_list(self) -> None:
+        clear_layout(self.ignored_list_layout)
+        entries = ignored_folders(self.store)
+        self.ignored_rows: List[QWidget] = []
+        if not entries:
+            self.ignored_list_layout.addWidget(theme.label("No folders are ignored.", "muted"))
+            return
+        for path in entries:
+            row = QFrame()
+            row.setObjectName("IgnoredRow")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(10, 4, 4, 4)
+            rl.setSpacing(8)
+            lbl = ElidedLabel(path, mode=Qt.TextElideMode.ElideMiddle)
+            theme.set_role(lbl, "mono")
+            rl.addWidget(lbl, 1)
+            btn = QPushButton("Stop ignoring")
+            btn.setObjectName("QuietBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(f"Let scans import this folder again:\n{path}")
+            btn.clicked.connect(lambda checked=False, p=path: self._stop_ignoring(p))
+            rl.addWidget(btn)
+            row.setProperty("folder", path)
+            self.ignored_rows.append(row)
+            self.ignored_list_layout.addWidget(row)
+
+    def _stop_ignoring(self, path: str) -> None:
+        remove_ignored_folder(self.store, path)
+        self._refresh_ignored_list()
 
     def _open_connections_wizard(self) -> None:
         self.reject()
@@ -930,7 +1037,7 @@ class HeliosSettingsDialog(QDialog):
         active_found = False
 
         if not models:
-            self.combo_model.addItem("No Installed Model Found", "")
+            self.combo_model.addItem("No installed model found", "")
             return
 
         for m in models:
@@ -948,7 +1055,7 @@ class HeliosSettingsDialog(QDialog):
     def _start_pull_model(self) -> None:
         target_name = self.edit_pull.text().strip()
         if not target_name:
-            QMessageBox.warning(self, "Model Name Required", "Please enter the model name to download (e.g., qwen2.5-coder:3b).")
+            QMessageBox.warning(self, "Model name required", "Please enter the model name to download (e.g., qwen2.5-coder:3b).")
             return
 
         self.btn_pull.setEnabled(False)
@@ -965,9 +1072,9 @@ class HeliosSettingsDialog(QDialog):
         self.lbl_pull_status.setText(msg)
         if ok:
             self._refresh_models_list()
-            QMessageBox.information(self, "Download Complete", msg)
+            QMessageBox.information(self, "Download complete", msg)
         else:
-            QMessageBox.warning(self, "Download Failed", msg)
+            QMessageBox.warning(self, "Download failed", msg)
 
     def _run_deduplication(self) -> None:
         res = self.store.merge_all_duplicates()
@@ -985,14 +1092,14 @@ class HeliosSettingsDialog(QDialog):
             summary = " and ".join(parts)
             QMessageBox.information(
                 self,
-                "Merge Complete",
+                "Merge complete",
                 f"Successfully merged {summary}!",
             )
         else:
             QMessageBox.information(
                 self,
-                "No Duplicates Found",
-                "No duplicate projects or modules were found; the graph is already clean.",
+                "No duplicates found",
+                "No duplicate projects or modules were found.",
             )
 
     def _open_helios_projects_folder(self) -> None:
@@ -1003,22 +1110,50 @@ class HeliosSettingsDialog(QDialog):
             else:
                 subprocess.Popen(["xdg-open", str(p_dir)])
         except Exception as exc:
-            QMessageBox.warning(self, "Could Not Open Folder", f"Error: {exc}")
+            QMessageBox.warning(self, "Could not open folder", f"Error: {exc}")
+
+    def reject(self) -> None:
+        # Keep the dialog open while its background scan owns the store.
+        if getattr(self, "_scan_running", False):
+            return
+        super().reject()
 
     def _scan_helios_projects_folder(self) -> None:
-        results = CodebaseImporter.scan_helios_projects(self.store)
-        p_dir = CodebaseImporter.get_helios_projects_dir()
+        worker = CodebaseScanWorker(self.store)
+        self._scan_running = True
+        self.setEnabled(False)
+        self.setCursor(Qt.CursorShape.BusyCursor)
+        if not start_store_worker(self, worker, self._on_projects_scan_finished, "Scanning the Helios 'projects/' directory..."):
+            self._scan_running = False
+            self.setEnabled(True)
+            self.unsetCursor()
+            QMessageBox.information(
+                self,
+                "Scan already running",
+                "Another scan is running. Please wait for it to finish.",
+            )
+
+    def _on_projects_scan_finished(self, ok: bool, msg: str, payload: object) -> None:
+        self._scan_running = False
+        self.setEnabled(True)
+        self.unsetCursor()
+        if not ok:
+            QMessageBox.warning(self, "Scan failed", msg)
+            return
+        data = payload if isinstance(payload, dict) else {}
+        results = data.get("systems") or []
+        p_dir = data.get("projects_dir") or CodebaseImporter.get_helios_projects_dir()
         if results:
             QMessageBox.information(
                 self,
-                "Projects Scanned",
+                "Projects scanned",
                 f"Analyzed {len(results)} project(s) in the Helios 'projects/' folder and generated their architecture maps!",
             )
             self.accept()
         else:
             QMessageBox.information(
                 self,
-                "No Projects Found",
+                "No projects found",
                 f"No project directories were found inside '{p_dir}'.\n\n"
                 f"Copy any project folders you want to inspect into this directory.",
             )
@@ -1028,163 +1163,14 @@ class HeliosSettingsDialog(QDialog):
         if chosen_m:
             self.store.set_setting("selected_ollama_model", str(chosen_m))
         self.store.set_setting("disable_ollama", self.chk_disable_ollama.isChecked())
+        self.store.set_setting(AUTO_PURPOSE_SETTING_KEY, self.chk_auto_purpose.isChecked())
+        self.store.set_setting(
+            LANGUAGE_SETTING_KEY, str(self.combo_language.currentData() or DEFAULT_LANGUAGE)
+        )
         self.accept()
 
-DARK_STYLESHEET = """
-QMainWindow, QWidget {
-    background-color: #0D1117;
-    color: #E2E8F0;
-    font-family: 'Segoe UI', -apple-system, sans-serif;
-    font-size: 12px;
-}
-QFrame#TopBar {
-    background-color: #11161F;
-    border-bottom: 1px solid #1E2633;
-}
-QFrame#BreadcrumbBar {
-    background-color: #0F141C;
-    border-bottom: 1px solid #1B2230;
-}
-QFrame#LeftSidebar {
-    background-color: #10151E;
-    border-right: 1px solid #1E2633;
-}
-QFrame#SidePanel {
-    background-color: #10151E;
-    border-left: 1px solid #1E2633;
-}
-QFrame#PinnedSunCard {
-    background-color: #151C28;
-    border: 1px solid #243044;
-    border-radius: 8px;
-}
-QFrame#TourCard {
-    background-color: #151F30;
-    border: 1px solid #2B4268;
-    border-radius: 8px;
-}
-QFrame#DetailCard {
-    background-color: #141A24;
-    border: 1px solid #222B3A;
-    border-radius: 8px;
-}
-QTreeWidget {
-    background-color: #0D1117;
-    border: 1px solid #1E2633;
-    border-radius: 6px;
-    color: #CBD5E1;
-    font-size: 12px;
-    outline: none;
-    padding: 4px;
-}
-QTreeWidget::item {
-    padding: 5px 6px;
-    border-radius: 4px;
-}
-QTreeWidget::item:selected {
-    background-color: #1E293B;
-    color: #F8FAFC;
-}
-QTreeWidget::item:hover {
-    background-color: #161E2B;
-}
-QPushButton {
-    background-color: #18202D;
-    color: #E2E8F0;
-    border: 1px solid #283347;
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-weight: 600;
-    font-size: 11.5px;
-}
-QPushButton:hover {
-    background-color: #212B3C;
-    border-color: #384761;
-}
-QPushButton:pressed {
-    background-color: #141B26;
-}
-QPushButton:disabled {
-    background-color: #121721;
-    color: #475569;
-    border-color: #1E2633;
-}
-QPushButton#PrimaryBtn {
-    background-color: #2563EB;
-    border: 1px solid #3B82F6;
-    color: #FFFFFF;
-}
-QPushButton#PrimaryBtn:hover {
-    background-color: #1D4ED8;
-}
-QPushButton#OllamaBtn {
-    background-color: #17253B;
-    border: 1px solid #2E4F82;
-    color: #93C5FD;
-}
-QPushButton#OllamaBtn:hover {
-    background-color: #1E3250;
-    border-color: #3B82F6;
-    color: #FFFFFF;
-}
-QPushButton#SubtleBtn {
-    background-color: #141A24;
-    border: 1px solid #222B3A;
-    color: #94A3B8;
-}
-QPushButton#SubtleBtn:hover {
-    background-color: #1B2330;
-    color: #E2E8F0;
-}
-QPushButton#DangerBtn {
-    background-color: #23161B;
-    border: 1px solid #4C232E;
-    color: #F87171;
-}
-QPushButton#DangerBtn:hover {
-    background-color: #351C24;
-    border-color: #6E2C3A;
-}
-QLineEdit, QTextEdit, QComboBox {
-    background-color: #0D1117;
-    color: #F1F5F9;
-    border: 1px solid #242E3F;
-    border-radius: 6px;
-    padding: 6px 8px;
-    font-size: 12px;
-    selection-background-color: #2563EB;
-}
-QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
-    border: 1px solid #3B82F6;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 20px;
-}
-QSplitter::handle {
-    background-color: #1E2633;
-}
-QLabel#SectionHeader {
-    color: #94A3B8;
-    font-weight: 700;
-    font-size: 11px;
-    letter-spacing: 0.6px;
-}
-QLabel#StatusHint {
-    background-color: #11161F;
-    color: #94A3B8;
-    border-top: 1px solid #1E2633;
-    padding: 6px 12px;
-    font-size: 11px;
-}
-QToolTip {
-    background-color: #151C28;
-    color: #F1F5F9;
-    border: 1px solid #334155;
-    padding: 6px;
-    border-radius: 4px;
-}
-"""
+# Kept for compatibility: the stylesheet now lives in ui/theme.py.
+DARK_STYLESHEET = theme.stylesheet()
 
 PLANET_COLOR_PRESETS = [
     ("Blue (Architecture / UI)", "#3B82F6"),
@@ -1210,11 +1196,9 @@ class HeliosMainWindow(QMainWindow):
     def __init__(self, store: Optional[GalaxyStore] = None) -> None:
         super().__init__()
         self.store = store if store is not None else GalaxyStore()
-        self.setWindowTitle("Helios — Architecture & Knowledge Graph")
+        self.setWindowTitle("Helios")
         self.resize(1560, 930)
-        self.setStyleSheet(DARK_STYLESHEET)
-
-        self._initial_auto_scan()
+        theme.apply_app_theme(QApplication.instance())
 
         self._selected_node: Optional[object] = None
         self._selected_type: str = "sun"
@@ -1222,22 +1206,280 @@ class HeliosMainWindow(QMainWindow):
         self.tree_group_mode: str = "project"
         self._ollama_worker: Optional[OllamaEnhanceWorker] = None
 
+        # Busy state: see `_run_store_worker` / ui/workers.py module docstring.
+        self._store_busy = False
+        self._store_worker: Optional[StoreWorker] = None
+        self._store_worker_done_cb = None
+        self._busy_active_id: Optional[str] = None
+        self._pending_ollama_results: List[tuple] = []
+        self._pending_ollama_finish: Optional[tuple] = None
+        self._pending_ollama_module_results: List[tuple] = []
+        self._pending_ollama_purpose_results: List[tuple] = []
+        # Purpose results: (purpose, purpose_source) of each project when the run started,
+        # and the ids whose user-written purpose the user agreed to replace.
+        self._purpose_originals: Dict[str, str] = {}  # system id -> evidence key at the start
+        self._purpose_rejections: List[tuple] = []  # (system id, message) of the current run
+        self._ollama_stop_requested = False
+        self._purpose_run: Optional[dict] = None
+        self._auto_purpose_queued = False
+        self._auto_purpose_then_modules: Optional[str] = None
+        self._ollama_applied = 0
+        # Ignore-list entries added by "Remove and never import" (undo stack depth, path).
+        self._ignore_undo: List[tuple] = []
+        self._ignore_redo: List[tuple] = []
+        self._ollama_server_check_worker: Optional[OllamaServerCheckWorker] = None
+        self._model_detect_worker: Optional[ModelDetectWorker] = None
+        self._startup_tasks_scheduled = False
+        self._shortcuts: List[QShortcut] = []
+        self._busy_lock_widgets: List[QWidget] = []
+
+        # The preferred-model lookup (HTTP + disk scan) is deferred until after the
+        # window is shown (`_detect_ollama_model_async`) so startup never blocks on it.
         saved_m = self.store.get_setting("selected_ollama_model")
-        self._detected_ollama_model: Optional[str] = (
-            str(saved_m) if saved_m else OllamaEnhancer.get_preferred_model()
-        )
+        self._detected_ollama_model: Optional[str] = str(saved_m) if saved_m else None
+
+        self._skipped_details: List[tuple] = []
+        self._skipped_dialog: Optional[QDialog] = None
+        self._edit_dirty = False
+        self._dot_icon_cache: Dict[str, QIcon] = {}
 
         self._build_ui()
+        self._canvas_freezer = CanvasPaintFreezer(self.canvas, self)
         self._setup_shortcuts()
         self._setup_live_file_watcher()
         self._populate_tree()
         self._refresh_sun_anchor_card()
+        self._refresh_ai_controls()
         self._update_breadcrumb()
+        migrated = int(getattr(self.store, "migrated_purposes", 0) or 0)
+        # Older data stored Ollama's answers as purposes; they are suggestions now. Shown
+        # once, after the startup sync (`_show_migration_notice`), so it is not overwritten.
+        self._migration_notice = (
+            f"{migrated} project description{'s' if migrated != 1 else ''} written by Ollama "
+            f"{'are' if migrated != 1 else 'is'} now shown as \u201cSuggested\u201d until you accept "
+            f"{'them' if migrated != 1 else 'it'}." if migrated else ""
+        )
 
         if self.canvas.active_system:
             self._load_node_into_inspector(self.canvas.active_system, "sun")
 
         QTimer.singleShot(150, self._check_first_run_onboarding)
+        if getattr(self.store, "load_error", None):
+            QTimer.singleShot(0, self._warn_store_load_error)
+
+    # ------------------------------------------------------------------
+    # Startup tasks, data-file warnings & background-worker busy state
+    # ------------------------------------------------------------------
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._startup_tasks_scheduled:
+            # Runs after the window is visible with the previously saved graph.
+            self._startup_tasks_scheduled = True
+            QTimer.singleShot(200, self._initial_auto_scan)
+            if not self._detected_ollama_model:
+                QTimer.singleShot(400, self._detect_ollama_model_async)
+
+    def _store_load_error_text(self) -> str:
+        err = getattr(self.store, "load_error", None)
+        if not err:
+            return ""
+        backup = getattr(self.store, "backup_path", None)
+        text = (
+            f"Helios could not read its data file:\n{self.store.storage_path}\n\n"
+            f"{err}\n\n"
+            "Nothing was overwritten."
+        )
+        if backup:
+            text += f"\nA backup of the unreadable file is kept at:\n{backup}"
+        return text
+
+    def _warn_store_load_error(self) -> None:
+        text = self._store_load_error_text()
+        if text:
+            QMessageBox.warning(self, "Data file could not be read", text)
+
+    def _detect_ollama_model_async(self) -> None:
+        if self._detected_ollama_model or self._model_detect_worker is not None:
+            return
+        worker = ModelDetectWorker(self)
+        worker.detected.connect(self._on_ollama_model_detected)
+        self._model_detect_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_ollama_model_detected(self, model: object) -> None:
+        worker = self._model_detect_worker
+        self._model_detect_worker = None
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+        if model and not self._detected_ollama_model:
+            self._detected_ollama_model = str(model)
+            self._refresh_ai_controls()
+            self._update_ollama_button_tooltip()
+            if not self._is_ollama_running():
+                self.btn_ollama_single.setText(self._ollama_button_label())
+
+    def is_store_busy(self) -> bool:
+        return self._store_busy
+
+    def _run_store_worker(self, worker: StoreWorker, on_done=None, busy_text: str = "Working...") -> bool:
+        """Runs a store-mutating worker under the window-wide busy state.
+
+        While the worker owns the store:
+        - the toolbar, project tree, breadcrumb bar, canvas, inspector panel and all
+          window shortcuts (undo/redo/delete, ...) are disabled, so nothing on the UI
+          thread can edit/save the store or start another scan; the window itself still
+          moves, resizes and repaints, and progress is shown in the status bar;
+        - the canvas is frozen (CanvasPaintFreezer: animation timer stopped, updates
+          disabled, viewport paint events swallowed) so no paint code iterates node
+          lists the worker is replacing;
+        - `_on_external_store_changed` ignores file-watcher events, and Ollama results
+          are queued until the worker is done;
+        - a second worker is rejected (returns False).
+        On finish the UI is re-enabled and the tree/canvas/anchor card/breadcrumb are
+        rebuilt before `on_done(ok, message, payload)` runs. `closeEvent` waits for a
+        running worker instead of destroying it.
+        """
+        if self._store_worker is not None or self._store_busy:
+            self.status_label.setText("Another scan is already running. Please wait for it to finish.")
+            return False
+        self._store_worker = worker
+        self._store_worker_done_cb = on_done
+        worker.setParent(self)
+        worker.progressText.connect(self._on_store_worker_progress)
+        worker.finishedWork.connect(self._on_store_worker_finished)
+        self._set_store_busy(True, busy_text)
+        worker.start()
+        return True
+
+    def _set_store_busy(self, busy: bool, text: str = "") -> None:
+        if busy == self._store_busy:
+            return
+        self._store_busy = busy
+        if busy:
+            self._busy_active_id = self.canvas.active_system.id if self.canvas.active_system else None
+            self._canvas_freezer.freeze()
+            QApplication.setOverrideCursor(QCursor(Qt.CursorShape.BusyCursor))
+        for w in self._busy_lock_widgets:
+            w.setEnabled(not busy)
+        for sc in self._shortcuts:
+            sc.setEnabled(not busy)
+        if hasattr(self, "connections_view"):
+            self.connections_view.set_busy(busy, text)
+        if busy:
+            if text:
+                self.status_label.setText(text)
+        else:
+            self._canvas_freezer.unfreeze()
+            QApplication.restoreOverrideCursor()
+            self._schedule_queued_auto_purpose()
+        self._update_busy_indicator()
+
+    @Slot(str)
+    def _on_store_worker_progress(self, msg: str) -> None:
+        self.status_label.setText(msg)
+
+    @Slot(bool, str, object)
+    def _on_store_worker_finished(self, ok: bool, msg: str, payload: object) -> None:
+        worker = self._store_worker
+        on_done = self._store_worker_done_cb
+        self._store_worker = None
+        self._store_worker_done_cb = None
+        was_sync = isinstance(worker, AgentSyncWorker)
+        was_projects_scan = isinstance(worker, CodebaseScanWorker) and getattr(worker, "folder", None) is None
+        if worker is not None:
+            worker.wait(5000)  # finishedWork is the last thing run() does
+            worker.deleteLater()
+
+        self._set_store_busy(False)
+        self._refresh_after_store_worker()
+        self.status_label.setText(msg)
+        try:
+            if on_done:
+                on_done(ok, msg, payload)
+        finally:
+            self._flush_pending_ollama_results()
+            if was_sync and ok:
+                self._update_skipped_folders_link()
+            if ok and (was_sync or was_projects_scan):
+                # Single-folder analyses do this from _on_codebase_folder_analyzed (purpose, then modules).
+                self._maybe_auto_suggest_purposes()
+
+    def _node_in_store(self, node: object) -> bool:
+        for s in self.store.systems:
+            if node is s:
+                return True
+            if any(node is x for x in s.links) or any(node is x for x in s.notes):
+                return True
+            for p in s.planets:
+                if node is p or any(node is sat for sat in p.satellites):
+                    return True
+        return False
+
+    def _refresh_after_store_worker(self) -> None:
+        """Rebuilds every store-derived view after a worker changed the store."""
+        active = self.canvas.active_system
+        if active is None or not any(s is active for s in self.store.systems):
+            target = None
+            if self._busy_active_id:
+                target = next((s for s in self.store.systems if s.id == self._busy_active_id), None)
+            if target is None and self.store.systems:
+                target = self.store.systems[0]
+            self.canvas.active_system = target
+            if self.canvas.selected_node is not None and not self._node_in_store(self.canvas.selected_node):
+                self.canvas.selected_node = target
+        self._updating_ui = True
+        try:
+            self._populate_tree()
+            self.canvas.rebuild_scene()
+            self._refresh_sun_anchor_card()
+            self._update_breadcrumb()
+        finally:
+            self._updating_ui = False
+        # Inspector edits must never target objects the scan replaced.
+        if self._selected_node is not None and not self._node_in_store(self._selected_node):
+            if self.canvas.active_system:
+                self._load_node_into_inspector(self.canvas.active_system, "sun")
+        self._rearm_file_watcher()
+
+    def _rearm_file_watcher(self) -> None:
+        if (
+            self.store.storage_path.exists()
+            and str(self.store.storage_path) not in self.file_watcher.files()
+        ):
+            self.file_watcher.addPath(str(self.store.storage_path))
+
+    def closeEvent(self, event) -> None:
+        """Waits (bounded) for running background threads instead of destroying them."""
+        if self._is_ollama_running():
+            # Stops between (and during) Ollama requests, so closing is quick.
+            self._ollama_worker.requestInterruption()
+        threads = [
+            t
+            for t in (
+                self._store_worker,
+                self._ollama_worker,
+                self._model_detect_worker,
+                self._ollama_server_check_worker,
+            )
+            if t is not None and t.isRunning()
+        ]
+        if threads:
+            self.status_label.setText("Waiting for background tasks to finish before closing...")
+            QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+            try:
+                for t in threads:
+                    t.wait(15000)
+            finally:
+                QApplication.restoreOverrideCursor()
+            if any(t.isRunning() for t in threads):
+                event.ignore()
+                self.status_label.setText(
+                    "A background task is still running. Helios will close once it finishes — try closing again shortly."
+                )
+                return
+        super().closeEvent(event)
 
     def _check_first_run_onboarding(self) -> None:
         """Opens the full-window integrations view inside the main window on first launch."""
@@ -1272,49 +1514,87 @@ class HeliosMainWindow(QMainWindow):
         if not hasattr(self, "central_stack"):
             return
         if page_name == "connections":
-            self.btn_connections.setText("Back to Graph")
-            self.btn_connections.setStyleSheet(
-                "background-color: #2563EB; color: #FFFFFF; font-weight: 600; border: 1px solid #3B82F6;"
-            )
+            self.btn_connections.setText("Back to map")
+            self.btn_connections.setChecked(True)
             self.connections_view.refresh_state()
             self.central_stack.setCurrentIndex(1)
-            self.status_label.setText("Integrations & Data Sources — Select the tools you want to connect.")
+            self.status_label.setText("Integrations · choose the tools you want to connect.")
         else:
             self.btn_connections.setText("Integrations")
-            self.btn_connections.setStyleSheet("")
+            self.btn_connections.setChecked(False)
             self.central_stack.setCurrentIndex(0)
-            self.status_label.setText("Architecture Graph View.")
+            self.status_label.setText("Map view.")
+
+    def _show_migration_notice(self) -> None:
+        """One quiet status line after loading data written before format version 2."""
+        notice, self._migration_notice = getattr(self, "_migration_notice", ""), ""
+        if notice:
+            self.status_label.setText(notice)
+            self.status_label.setToolTip(notice)
 
     def _initial_auto_scan(self) -> None:
+        if not self._initial_auto_scan_started():
+            QTimer.singleShot(0, self._show_migration_notice)
+
+    def _initial_auto_scan_started(self) -> bool:
+        """Starts the startup sync; False when none runs (the caller then shows notices)."""
         if not self.store.get_setting("onboarding_completed", False):
             # Wait for the user to complete the first-run integrations view
-            return
+            return False
 
+        if getattr(self.store, "load_error", None):
+            # Never rescan into (and save over) a store whose data file could not be read.
+            return False
+
+        # Runs after the window is shown (see showEvent) on a background worker.
         connected = self.store.get_setting("connected_sources", ["antigravity", "codebase"])
-        if isinstance(connected, list) and connected:
-            try:
-                AgentHistoryImporter.scan_selected_sources(self.store, connected, max_sessions=25)
-            except Exception:
-                pass
+        sources = list(connected) if isinstance(connected, list) else []
+        if not sources:
+            return False
+        worker = AgentSyncWorker(
+            self.store,
+            sources,
+            max_sessions=25,
+            analyze_helios="codebase" in sources,
+            helios_dir=HELIOS_ROOT,
+        )
+        return bool(self._run_store_worker(
+            worker, self._on_initial_auto_scan_finished, "Synchronizing connected AI session histories..."
+        ))
 
-        if "codebase" in connected:
-            helios_dir = Path(__file__).resolve().parent.parent
-            has_helios_code = any(
-                s.source == "codebase" and s.project_name.lower() == "helios"
-                for s in self.store.systems
-            )
-            if not has_helios_code:
-                try:
-                    CodebaseImporter.analyze_directory(helios_dir, self.store)
-                except Exception:
-                    pass
+    def _on_initial_auto_scan_finished(self, ok: bool, msg: str, payload: object) -> None:
+        if ok:
+            self.status_label.setText(f"Startup sync finished. {msg}")
+        else:
+            self.status_label.setText(msg)
+        if getattr(self, "_migration_notice", ""):
+            QTimer.singleShot(2500, self._show_migration_notice)
 
     def _get_model_status_text(self) -> str:
-        if self.store.get_setting("disable_ollama", False):
-            return "AI: Standalone (Deterministic)"
-        model_name = self._detected_ollama_model or "No Model"
-        short = model_name.split(":")[0]
-        return f"AI: {short}"
+        """Status-bar text about the local model; "" (label hidden) when Ollama is off or
+        no model was found, so a computer without Ollama shows no AI hints at all."""
+        if not self._ai_available():
+            return ""
+        return f"Ollama: {self._detected_ollama_model}"
+
+    def _set_ollama_status(self, text: str) -> None:
+        if not hasattr(self, "lbl_ollama_status"):
+            return
+        self.lbl_ollama_status.setText(text)
+        self.lbl_ollama_status.setVisible(bool(text))
+
+    def _refresh_ai_controls(self) -> None:
+        """Shows the AI controls only when Ollama is enabled and a model was found (the
+        "Enhance with Ollama" button stays visible as "Stop Ollama" while a run is active)."""
+        available = self._ai_available()
+        if hasattr(self, "btn_ollama_single"):
+            self.btn_ollama_single.setVisible(available or self._is_ollama_running())
+        if hasattr(self, "canvas"):
+            self.canvas.ai_available = available
+        if not self._is_ollama_running():
+            self._set_ollama_status(self._get_model_status_text())
+        if hasattr(self, "lbl_purpose") and hasattr(self, "canvas"):
+            self._refresh_purpose_block(self.canvas.active_system)
 
     def _open_helios_projects_folder(self) -> None:
         p_dir = CodebaseImporter.get_helios_projects_dir()
@@ -1325,30 +1605,41 @@ class HeliosMainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", str(p_dir)])
             self.status_label.setText(f"Opened 'projects/' directory: {p_dir}")
         except Exception as exc:
-            QMessageBox.warning(self, "Could Not Open Folder", f"Error: {exc}")
+            QMessageBox.warning(self, "Could not open folder", f"Error: {exc}")
 
     def _scan_helios_projects_directly(self) -> None:
-        results = CodebaseImporter.scan_helios_projects(self.store)
-        p_dir = CodebaseImporter.get_helios_projects_dir()
+        worker = CodebaseScanWorker(self.store)
+        if not self._run_store_worker(
+            worker, self._on_projects_scan_finished, "Scanning the Helios 'projects/' directory..."
+        ):
+            QMessageBox.information(
+                self,
+                "Scan already running",
+                "Another scan is running. Please wait for it to finish.",
+            )
+
+    def _on_projects_scan_finished(self, ok: bool, msg: str, payload: object) -> None:
+        if not ok:
+            self.status_label.setText(msg)
+            QMessageBox.warning(self, "Scan failed", msg)
+            return
+        data = payload if isinstance(payload, dict) else {}
+        results = data.get("systems") or []
+        p_dir = data.get("projects_dir") or CodebaseImporter.get_helios_projects_dir()
         if results:
-            self._updating_ui = True
-            self._populate_tree()
-            self.canvas.rebuild_scene()
-            self._refresh_sun_anchor_card()
-            self._update_breadcrumb()
-            self._updating_ui = False
+            # Tree, canvas, anchor card and breadcrumb were rebuilt by _refresh_after_store_worker.
             self.status_label.setText(
                 f"Analyzed {len(results)} project(s) in the Helios 'projects/' directory!"
             )
             QMessageBox.information(
                 self,
-                "Projects Scanned",
+                "Projects scanned",
                 f"Analyzed {len(results)} project(s) in the 'projects/' directory and generated their architecture maps!",
             )
         else:
             QMessageBox.information(
                 self,
-                "No Projects Found",
+                "No projects found",
                 f"No project directories were found inside '{p_dir}'.\n\n"
                 f"Copy any project folders you want to inspect into this 'projects/' directory.",
             )
@@ -1359,11 +1650,12 @@ class HeliosMainWindow(QMainWindow):
             saved_m = self.store.get_setting("selected_ollama_model")
             if saved_m:
                 self._detected_ollama_model = str(saved_m)
-            self.lbl_ollama_status.setText(self._get_model_status_text())
+            self._refresh_ai_controls()
+            self._update_ollama_button_tooltip()
             self._populate_tree()
             self.canvas.rebuild_scene()
             self._refresh_sun_anchor_card()
-            self.status_label.setText("Settings updated.")
+            self.status_label.setText("Settings saved.")
 
     def _setup_shortcuts(self) -> None:
         sc_search = QShortcut(QKeySequence("Ctrl+F"), self)
@@ -1398,6 +1690,21 @@ class HeliosMainWindow(QMainWindow):
         sc_zoom_reset = QShortcut(QKeySequence("Ctrl+0"), self)
         sc_zoom_reset.activated.connect(self.canvas.reset_zoom)
 
+        # "F" fits the map (text fields keep typing "f": they take the key first).
+        sc_fit = QShortcut(QKeySequence("F"), self)
+        sc_fit.activated.connect(self._fit_view_shortcut)
+
+        # Kept so the busy state can disable all of them while a worker owns the store.
+        self._shortcuts = [
+            sc_search, sc_esc, sc_undo, sc_redo1, sc_redo2, sc_del,
+            sc_zoom_in1, sc_zoom_in2, sc_zoom_out, sc_zoom_reset, sc_fit,
+        ]
+
+    def _fit_view_shortcut(self) -> None:
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QComboBox)):
+            return
+        self.canvas.fit_to_view()
+
     def _handle_delete_shortcut(self) -> None:
         focused = QApplication.focusWidget()
         if isinstance(focused, (QLineEdit, QTextEdit)):
@@ -1406,7 +1713,12 @@ class HeliosMainWindow(QMainWindow):
             self._delete_current_node()
 
     def _on_undo(self) -> None:
+        depth = len(getattr(self.store, "_undo_stack", []))
+        undone_ignore = self._ignore_undo.pop() if self._ignore_undo and self._ignore_undo[-1][0] == depth else None
         if self.store.undo():
+            if undone_ignore is not None:
+                remove_ignored_folder(self.store, undone_ignore[1])
+                self._ignore_redo.append((len(getattr(self.store, "_redo_stack", [])), undone_ignore[1]))
             self._updating_ui = True
             active_id = self.canvas.active_system.id if self.canvas.active_system else None
             if active_id:
@@ -1414,17 +1726,28 @@ class HeliosMainWindow(QMainWindow):
                     if s.id == active_id:
                         self.canvas.active_system = s
                         break
+            if self.canvas.active_system is None or not any(
+                s is self.canvas.active_system for s in self.store.systems
+            ):
+                self.canvas.active_system = self.store.systems[0] if self.store.systems else None
             self._populate_tree()
             self.canvas.rebuild_scene()
             self._refresh_sun_anchor_card()
             self._update_breadcrumb()
             self._updating_ui = False
+            if self._selected_node is None or not self._node_in_store(self._selected_node):
+                if self.canvas.active_system is not None:
+                    self._load_node_into_inspector(self.canvas.active_system, "sun")
             self.status_label.setText("Undo (Ctrl+Z) applied.")
         else:
             self.status_label.setText("Nothing left to undo.")
 
     def _on_redo(self) -> None:
+        rdepth = len(getattr(self.store, "_redo_stack", []))
+        redone_ignore = self._ignore_redo.pop() if self._ignore_redo and self._ignore_redo[-1][0] == rdepth else None
         if self.store.redo():
+            if redone_ignore is not None and add_ignored_folder(self.store, redone_ignore[1]):
+                self._ignore_undo.append((len(getattr(self.store, "_undo_stack", [])), redone_ignore[1]))
             self._updating_ui = True
             active_id = self.canvas.active_system.id if self.canvas.active_system else None
             if active_id:
@@ -1446,6 +1769,9 @@ class HeliosMainWindow(QMainWindow):
         self.search_input.selectAll()
 
     def _on_escape_pressed(self) -> None:
+        if hasattr(self, "purpose_edit_box") and self.purpose_edit_box.isVisible():
+            self._cancel_purpose_edit()
+            return
         if getattr(self, "central_stack", None) and self.central_stack.currentIndex() == 1:
             self._switch_to_page("studio")
             return
@@ -1473,14 +1799,24 @@ class HeliosMainWindow(QMainWindow):
         self.file_watcher.fileChanged.connect(self._on_external_store_changed)
 
     def _on_external_store_changed(self, path: str) -> None:
-        if self._updating_ui:
+        if self._updating_ui or self._store_busy:
+            # A background worker owns the store; the watcher is re-armed when it finishes.
             return
         if self.store.is_own_write():
             # Ignore file changes triggered by Helios itself
             return
         try:
             active_id = self.canvas.active_system.id if self.canvas.active_system else None
-            self.store.load()
+            loaded = self.store.load()
+            if loaded is False or getattr(self.store, "load_error", None):
+                # The in-memory graph is kept untouched when the file cannot be parsed.
+                err = getattr(self.store, "load_error", None) or "unknown error"
+                backup = getattr(self.store, "backup_path", None)
+                text = f"Live update could not be read ({err}). Nothing was overwritten."
+                if backup:
+                    text += f" Backup: {backup}"
+                self.status_label.setText(text)
+                return
             if active_id:
                 for sys_obj in self.store.systems:
                     if sys_obj.id == active_id:
@@ -1491,8 +1827,8 @@ class HeliosMainWindow(QMainWindow):
             self._refresh_sun_anchor_card()
             self._update_breadcrumb()
             self.status_label.setText("Live update received: Graph synchronized.")
-        except Exception:
-            pass
+        except Exception as exc:
+            self.status_label.setText(f"Live update failed: {exc}")
         finally:
             if (
                 self.store.storage_path.exists()
@@ -1505,193 +1841,160 @@ class HeliosMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         central = QWidget(self)
+        central.setObjectName("CentralRoot")
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # 1. Top Toolbar
+        # ---------------------------------------------------------------
+        # 1. Top bar: brand · breadcrumb · search · view toggles & actions
+        # ---------------------------------------------------------------
         top_bar = QFrame()
         top_bar.setObjectName("TopBar")
         top_bar.setFixedHeight(48)
         top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(14, 6, 14, 6)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(14, 8, 12, 8)
+        top_layout.setSpacing(6)
 
-        # Left: Brand & View Modes
-        brand_label = QLabel("HELIOS")
-        brand_font = QFont("Segoe UI", 11, QFont.Weight.Bold)
-        brand_label.setFont(brand_font)
-        brand_label.setStyleSheet("color: #F3F4F6; letter-spacing: 1px;")
+        brand_icon = QLabel()
+        brand_icon.setPixmap(self._sun_pixmap(16))
+        brand_icon.setFixedSize(18, 18)
+        top_layout.addWidget(brand_icon)
+        brand_label = theme.label("Helios", "brand")
         top_layout.addWidget(brand_label)
+        top_layout.addSpacing(14)
 
-        self.btn_view_mode = QPushButton("All Projects")
-        self.btn_view_mode.setObjectName("PrimaryBtn")
-        self.btn_view_mode.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_view_mode.setFixedHeight(28)
-        self.btn_view_mode.setToolTip("Toggle between All Projects Overview and Active Project View (ESC)")
-        self.btn_view_mode.clicked.connect(self._toggle_galaxy_view)
-        top_layout.addWidget(self.btn_view_mode)
+        # Breadcrumb: All projects › Project › Module › Component
+        self.btn_bc_galaxy = QPushButton("All projects")
+        self.btn_bc_galaxy.setObjectName("CrumbBtn")
+        self.btn_bc_galaxy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bc_galaxy.setToolTip("Show all projects (Esc)")
+        self.btn_bc_galaxy.clicked.connect(lambda: self.canvas.switch_to_galaxy_view())
+        top_layout.addWidget(self.btn_bc_galaxy)
+        self.lbl_bc_sep1 = theme.label("›", "crumb-sep")
+        top_layout.addWidget(self.lbl_bc_sep1)
+        self.btn_bc_project = QPushButton("")
+        self.btn_bc_project.setObjectName("CrumbBtn")
+        self.btn_bc_project.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bc_project.setToolTip("Show the whole project")
+        self.btn_bc_project.setMaximumWidth(220)
+        self.btn_bc_project.clicked.connect(self._on_project_crumb_clicked)
+        top_layout.addWidget(self.btn_bc_project)
+        self.lbl_bc_sep2 = theme.label("›", "crumb-sep")
+        top_layout.addWidget(self.lbl_bc_sep2)
+        self.lbl_breadcrumb = ElidedLabel("")
+        theme.set_role(self.lbl_breadcrumb, "crumb")
+        self.lbl_breadcrumb.setMinimumWidth(40)
+        top_layout.addWidget(self.lbl_breadcrumb, stretch=2)
 
-        self.btn_tour = QPushButton("Architecture Tour")
-        self.btn_tour.setObjectName("SubtleBtn")
-        self.btn_tour.setFixedHeight(28)
-        self.btn_tour.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_tour.setToolTip("Step through the project's architectural layers from the core outward")
-        self.btn_tour.clicked.connect(self._on_tour_clicked)
-        top_layout.addWidget(self.btn_tour)
-
-        top_layout.addStretch(1)
-
-        # Center: Search Bar
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search projects, modules, or files... (Ctrl+F)")
+        self.search_input.setObjectName("SearchField")
+        self.search_input.setPlaceholderText("Search projects, modules and components  (Ctrl+F)")
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.setFixedWidth(340)
-        self.search_input.setFixedHeight(28)
-        self.search_input.setStyleSheet(
-            "background-color: #141B26; border: 1px solid #28374D; border-radius: 6px; padding: 4px 10px; color: #F8FAFC;"
-        )
+        self.search_input.setMinimumWidth(170)
+        self.search_input.setMaximumWidth(340)
+        self.search_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.search_input.textChanged.connect(self._on_search_text_changed)
-        top_layout.addWidget(self.search_input)
+        top_layout.addWidget(self.search_input, stretch=3)
+        top_layout.addSpacing(10)
 
-        top_layout.addStretch(1)
+        def top_button(text: str, tip: str, checkable: bool = False) -> QPushButton:
+            btn = QPushButton(text)
+            btn.setObjectName("QuietBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.setCheckable(checkable)
+            top_layout.addWidget(btn)
+            return btn
 
-        # Right: Orbit Motion, Integrations, Sync & Settings
-        self.btn_toggle_orbit = QPushButton("Motion: Off")
-        self.btn_toggle_orbit.setObjectName("SubtleBtn")
-        self.btn_toggle_orbit.setFixedHeight(28)
-        self.btn_toggle_orbit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_orbit = top_button("Motion", "Let the modules orbit slowly (off by default)", True)
         self.btn_toggle_orbit.clicked.connect(self._toggle_orbit_motion)
-        top_layout.addWidget(self.btn_toggle_orbit)
-
-        self.btn_connections = QPushButton("Integrations")
-        self.btn_connections.setObjectName("SubtleBtn")
-        self.btn_connections.setFixedHeight(28)
-        self.btn_connections.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_connections.setToolTip("Manage Antigravity, Codex, Claude Code, and Ollama integrations")
-        self.btn_connections.clicked.connect(self._toggle_connections_page)
-        top_layout.addWidget(self.btn_connections)
-
-        self.btn_sync_agents = QPushButton("Sync")
-        self.btn_sync_agents.setObjectName("SubtleBtn")
-        self.btn_sync_agents.setFixedHeight(28)
-        self.btn_sync_agents.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_sync_agents.setToolTip("Scan connected AI tool histories and update the graph")
+        self.btn_fit_view = top_button("Fit view", "Fit the whole map into the window  (F, Ctrl+0)")
+        self.btn_fit_view.clicked.connect(lambda: self.canvas.fit_to_view())
+        self.btn_show_details = top_button(
+            "Show all details", "Always show every module's components, not only for the selected one", True
+        )
+        self.btn_show_details.setChecked(self.canvas_show_all_details_setting())
+        self.btn_show_details.clicked.connect(self._toggle_show_all_details)
+        sep = QFrame()
+        sep.setObjectName("Hairline")
+        sep.setFixedSize(1, 18)
+        top_layout.addSpacing(4)
+        top_layout.addWidget(sep)
+        top_layout.addSpacing(4)
+        self.btn_sync_agents = top_button("Sync", "Read the connected AI tools again and update the maps")
         self.btn_sync_agents.clicked.connect(self._sync_agent_histories)
-        top_layout.addWidget(self.btn_sync_agents)
-
-        self.btn_settings = QPushButton("Settings")
-        self.btn_settings.setObjectName("SubtleBtn")
-        self.btn_settings.setFixedHeight(28)
-        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_settings.setToolTip("Model management, batch project scanner, and deduplication")
+        self.btn_connections = top_button("Integrations", "Choose which AI tools and local models Helios uses", True)
+        self.btn_connections.clicked.connect(self._toggle_connections_page)
+        self.btn_settings = top_button("Settings", "Ollama model, the 'projects/' folder and duplicate merging")
         self.btn_settings.clicked.connect(self._open_settings_dialog)
-        top_layout.addWidget(self.btn_settings)
 
+        # Kept as an attribute for older call sites; the breadcrumb replaces it visually.
+        self.btn_view_mode = self.btn_bc_galaxy
         root_layout.addWidget(top_bar)
 
-        # 2. Main Body (3-Column Splitter)
+        # ---------------------------------------------------------------
+        # 2. Body: projects list | canvas | inspector
+        # ---------------------------------------------------------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(3)
+        self.main_splitter = splitter
 
-        # --- LEFT PANEL: Project Explorer ---
+        # --- Left: projects ---------------------------------------------
         left_sidebar = QFrame()
-        left_sidebar.setObjectName("LeftSidebar")
-        left_sidebar.setMinimumWidth(265)
-        left_sidebar.setMaximumWidth(390)
+        left_sidebar.setObjectName("LeftPanel")
+        left_sidebar.setMinimumWidth(220)
+        left_sidebar.setMaximumWidth(400)
         left_layout = QVBoxLayout(left_sidebar)
-        left_layout.setContentsMargins(10, 10, 10, 8)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(12, 12, 8, 8)
+        left_layout.setSpacing(8)
 
         header_row = QHBoxLayout()
-        tree_header = QLabel("PROJECT EXPLORER")
-        tree_header.setObjectName("SectionHeader")
-        header_row.addWidget(tree_header, stretch=1)
-
-        btn_collapse_all = QPushButton("−")
-        btn_collapse_all.setObjectName("SubtleBtn")
-        btn_collapse_all.setFixedSize(22, 22)
-        btn_collapse_all.setToolTip("Collapse All")
-        btn_collapse_all.clicked.connect(self.hierarchy_tree_collapse_all if hasattr(self, "hierarchy_tree_collapse_all") else lambda: self.hierarchy_tree.collapseAll())
-        header_row.addWidget(btn_collapse_all)
-
-        btn_expand_all = QPushButton("+")
-        btn_expand_all.setObjectName("SubtleBtn")
-        btn_expand_all.setFixedSize(22, 22)
-        btn_expand_all.setToolTip("Expand All")
-        btn_expand_all.clicked.connect(lambda: self.hierarchy_tree.expandAll())
-        header_row.addWidget(btn_expand_all)
-
-        btn_refresh_tree = QPushButton("↻")
-        btn_refresh_tree.setObjectName("SubtleBtn")
-        btn_refresh_tree.setFixedSize(22, 22)
-        btn_refresh_tree.setToolTip("Refresh Tree")
-        btn_refresh_tree.clicked.connect(self._populate_tree)
-        header_row.addWidget(btn_refresh_tree)
-        left_layout.addLayout(header_row)
-
-        # "+ Add Project" Button & Dropdown Menu
-        btn_add_proj_row = QHBoxLayout()
-        self.btn_add_project = QPushButton("+ Add Project")
+        header_row.setSpacing(6)
+        header_row.addWidget(theme.label("Projects", "section"), stretch=1)
+        self.btn_add_project = QPushButton("Add project")
         self.btn_add_project.setObjectName("PrimaryBtn")
-        self.btn_add_project.setFixedHeight(28)
+        self.btn_add_project.setProperty("menu", "true")
         self.btn_add_project.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_add_project.setToolTip("Scan projects in Helios 'projects/' folder or design a new project")
-
+        self.btn_add_project.setToolTip("Analyze a folder, scan the 'projects/' folder or design a project")
         proj_menu = QMenu(self)
-        proj_menu.setStyleSheet(
-            """
-            QMenu {
-                background-color: #0F172A;
-                color: #F8FAFC;
-                border: 1px solid #334155;
-                padding: 4px;
-                border-radius: 6px;
-            }
-            QMenu::item {
-                padding: 6px 14px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #2563EB;
-                color: #FFFFFF;
-            }
-            """
-        )
-        act_scan_p = proj_menu.addAction("Scan & Import 'projects/' Directory")
+        act_analyze = proj_menu.addAction("Analyze a folder…")
+        act_analyze.triggered.connect(self._analyze_codebase_folder)
+        act_scan_p = proj_menu.addAction("Scan the 'projects/' folder")
         act_scan_p.triggered.connect(self._scan_helios_projects_directly)
-        act_open_f = proj_menu.addAction("Open 'projects/' Directory in Explorer")
+        act_open_f = proj_menu.addAction("Open the 'projects/' folder")
         act_open_f.triggered.connect(self._open_helios_projects_folder)
         proj_menu.addSeparator()
-        act_create_new = proj_menu.addAction("Design New Project...")
+        act_create_new = proj_menu.addAction("Design a new project…")
         act_create_new.triggered.connect(self._create_new_system)
-
         self.btn_add_project.setMenu(proj_menu)
-        btn_add_proj_row.addWidget(self.btn_add_project, stretch=1)
+        header_row.addWidget(self.btn_add_project)
+        left_layout.addLayout(header_row)
 
-        btn_quick_open_folder = QPushButton("Folder")
-        btn_quick_open_folder.setObjectName("SubtleBtn")
-        btn_quick_open_folder.setFixedHeight(28)
-        btn_quick_open_folder.setToolTip("Open 'projects/' Directory in File Explorer")
-        btn_quick_open_folder.clicked.connect(self._open_helios_projects_folder)
-        btn_add_proj_row.addWidget(btn_quick_open_folder)
+        self.tree_filter = QLineEdit()
+        self.tree_filter.setObjectName("SearchField")
+        self.tree_filter.setPlaceholderText("Filter projects")
+        self.tree_filter.setClearButtonEnabled(True)
+        self.tree_filter.textChanged.connect(self._filter_tree)
+        left_layout.addWidget(self.tree_filter)
 
-        left_layout.addLayout(btn_add_proj_row)
-
-        # Grouping Mode Selector (By Project vs By Source)
-        group_mode_row = QHBoxLayout()
-        group_mode_row.setSpacing(4)
-        group_mode_row.setContentsMargins(0, 4, 0, 2)
-
-        self.btn_group_by_project = QPushButton("By Project")
-        self.btn_group_by_project.setFixedHeight(24)
+        seg = QFrame()
+        seg.setObjectName("Segmented")
+        seg_lay = QHBoxLayout(seg)
+        seg_lay.setContentsMargins(2, 2, 2, 2)
+        seg_lay.setSpacing(2)
+        self.btn_group_by_project = QPushButton("By project")
+        self.btn_group_by_project.setObjectName("SegBtn")
+        self.btn_group_by_project.setCheckable(True)
         self.btn_group_by_project.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_group_by_project.setToolTip("Groups counterparts of the same project (e.g., Antigravity & Claude/Codex) under a single heading")
-
-        self.btn_group_by_source = QPushButton("By Source")
-        self.btn_group_by_source.setFixedHeight(24)
+        self.btn_group_by_project.setToolTip("One entry per project, even if several tools worked on it")
+        self.btn_group_by_source = QPushButton("By source")
+        self.btn_group_by_source.setObjectName("SegBtn")
+        self.btn_group_by_source.setCheckable(True)
         self.btn_group_by_source.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_group_by_source.setToolTip("Lists projects grouped by application category (Antigravity, Codex, etc.)")
+        self.btn_group_by_source.setToolTip("Group projects by the tool they came from")
 
         def _select_project_mode() -> None:
             self.tree_group_mode = "project"
@@ -1705,336 +2008,63 @@ class HeliosMainWindow(QMainWindow):
 
         self.btn_group_by_project.clicked.connect(_select_project_mode)
         self.btn_group_by_source.clicked.connect(_select_source_mode)
-
-        group_mode_row.addWidget(self.btn_group_by_project, stretch=1)
-        group_mode_row.addWidget(self.btn_group_by_source, stretch=1)
-        left_layout.addLayout(group_mode_row)
+        seg_lay.addWidget(self.btn_group_by_project, stretch=1)
+        seg_lay.addWidget(self.btn_group_by_source, stretch=1)
+        left_layout.addWidget(seg)
 
         self.hierarchy_tree = QTreeWidget()
         self.hierarchy_tree.setHeaderHidden(True)
-        self.hierarchy_tree.setIndentation(14)
+        self.hierarchy_tree.setIndentation(16)
+        self.hierarchy_tree.setIconSize(QSize(10, 10))
+        self.hierarchy_tree.setUniformRowHeights(True)
         self.hierarchy_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.hierarchy_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self.hierarchy_tree.itemClicked.connect(self._on_tree_item_clicked)
+        self.hierarchy_tree.viewport().setAutoFillBackground(False)
         left_layout.addWidget(self.hierarchy_tree, stretch=1)
-
-        # Bottom-Left: Settings Button
-        self.btn_bottom_settings = QPushButton()
-        self.btn_bottom_settings.setObjectName("BottomSettingsBtn")
-        self.btn_bottom_settings.setFixedHeight(44)
-        self.btn_bottom_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_bottom_settings.setToolTip("Model, Folder Scanner, and Deduplication Settings")
-        self.btn_bottom_settings.setStyleSheet(
-            """
-            QPushButton#BottomSettingsBtn {
-                background-color: #11151C;
-                border: 1px solid #1E2532;
-                border-radius: 6px;
-                padding: 4px 10px;
-                text-align: left;
-            }
-            QPushButton#BottomSettingsBtn:hover {
-                background-color: #161C26;
-                border: 1px solid #2D3748;
-            }
-            QPushButton#BottomSettingsBtn:pressed {
-                background-color: #121720;
-            }
-            """
-        )
-
-        btn_lay = QHBoxLayout(self.btn_bottom_settings)
-        btn_lay.setContentsMargins(6, 4, 6, 4)
-        btn_lay.setSpacing(8)
-
-        text_box = QVBoxLayout()
-        text_box.setSpacing(1)
-        text_box.setContentsMargins(0, 0, 0, 0)
-
-        lbl_gear_title = QLabel("Settings & Preferences")
-        lbl_gear_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #E5E7EB; background: transparent; border: none;")
-        text_box.addWidget(lbl_gear_title)
-
-        self.lbl_ollama_status = QLabel(self._get_model_status_text())
-        self.lbl_ollama_status.setStyleSheet("font-size: 10px; font-weight: 400; color: #8B949E; background: transparent; border: none;")
-        text_box.addWidget(self.lbl_ollama_status)
-
-        btn_lay.addLayout(text_box, stretch=1)
-
-        arrow_badge = QLabel("›")
-        arrow_badge.setStyleSheet("font-size: 14px; font-weight: 600; color: #6B7280; background: transparent; border: none;")
-        btn_lay.addWidget(arrow_badge)
-
-        self.btn_bottom_settings.clicked.connect(self._open_settings_dialog)
-        left_layout.addWidget(self.btn_bottom_settings)
         self._update_group_toggle_styles()
         splitter.addWidget(left_sidebar)
 
-        # --- CENTER PANEL: Breadcrumb Bar + Interactive Architecture Canvas ---
-        canvas_container = QWidget()
-        canvas_layout = QVBoxLayout(canvas_container)
-        canvas_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_layout.setSpacing(0)
-
-        # Navigation Bar (Breadcrumb + Quick Canvas Controls)
-        breadcrumb_bar = QFrame()
-        breadcrumb_bar.setObjectName("BreadcrumbBar")
-        breadcrumb_bar.setFixedHeight(38)
-        bc_layout = QHBoxLayout(breadcrumb_bar)
-        bc_layout.setContentsMargins(12, 4, 12, 4)
-        bc_layout.setSpacing(8)
-
-        self.btn_bc_galaxy = QPushButton("All Projects")
-        self.btn_bc_galaxy.setObjectName("SubtleBtn")
-        self.btn_bc_galaxy.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_bc_galaxy.setFixedHeight(26)
-        self.btn_bc_galaxy.clicked.connect(lambda: self.canvas.switch_to_galaxy_view())
-        bc_layout.addWidget(self.btn_bc_galaxy)
-
-        self.lbl_breadcrumb = QLabel("›  No Project Selected")
-        self.lbl_breadcrumb.setStyleSheet("color: #CBD5E1; font-weight: 600; font-size: 11.5px;")
-        bc_layout.addWidget(self.lbl_breadcrumb, stretch=1)
-
-        self.btn_rebalance = QPushButton("Auto-Align Layout")
-        self.btn_rebalance.setObjectName("SubtleBtn")
-        self.btn_rebalance.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_rebalance.setFixedHeight(26)
-        self.btn_rebalance.setToolTip(
-            "Reset dragged module and sub-component positions back into a balanced circular layout"
-        )
-        self.btn_rebalance.clicked.connect(self._rebalance_active_system_layout)
-        bc_layout.addWidget(self.btn_rebalance)
-
-        canvas_layout.addWidget(breadcrumb_bar)
-
+        # --- Centre: canvas -----------------------------------------------
         self.canvas = SpaceCanvasView(self.store, self)
         self.canvas.nodeSelected.connect(self._on_canvas_node_selected)
         self.canvas.viewModeChanged.connect(self._on_view_mode_changed)
         self.canvas.tourStepChanged.connect(self._on_tour_step_changed)
         self.canvas.contextActionRequested.connect(self._on_canvas_context_action)
         self.canvas.drawingToolChanged.connect(self._on_drawing_tool_changed)
-        canvas_layout.addWidget(self.canvas, stretch=1)
+        self.canvas.showAllDetailsChanged.connect(self._on_show_all_details_changed)
+        self.canvas.setMinimumWidth(360)
+        splitter.addWidget(self.canvas)
+        # Older code paths toggled this; auto-align now lives in the canvas tool strip.
+        self.btn_rebalance = self.canvas.btn_strip_align
+        self.btn_tour = self.canvas.btn_strip_tour
 
-        self.status_label = QLabel(
-            "Left Click: Select / Open Project  •  Drag: Move Node or Pan  •  Right Click: Menu  •  ESC: All Projects"
-        )
-        self.status_label.setObjectName("StatusHint")
-        canvas_layout.addWidget(self.status_label)
-
-        splitter.addWidget(canvas_container)
-
-        # --- RIGHT PANEL: Pinned Project Core (Sun) + Detail Inspector ---
+        # --- Right: inspector ---------------------------------------------
         side_panel = QFrame()
-        side_panel.setObjectName("SidePanel")
-        side_panel.setMinimumWidth(390)
-        side_panel.setMaximumWidth(520)
+        side_panel.setObjectName("Inspector")
+        side_panel.setMinimumWidth(340)
+        side_panel.setMaximumWidth(620)
         side_layout = QVBoxLayout(side_panel)
-        side_layout.setContentsMargins(14, 14, 14, 14)
-        side_layout.setSpacing(12)
-
-        # A) Pinned Project Core (Sun) & Purpose Summary Card
-        self.sun_card = QFrame()
-        self.sun_card.setObjectName("PinnedSunCard")
-        sun_card_layout = QVBoxLayout(self.sun_card)
-        sun_card_layout.setContentsMargins(12, 10, 12, 10)
-        sun_card_layout.setSpacing(6)
-
-        sun_header_row = QHBoxLayout()
-        self.sun_badge_label = QLabel("PROJECT CORE & OVERVIEW")
-        self.sun_badge_label.setStyleSheet(
-            "color: #60A5FA; font-weight: 700; font-size: 11px; letter-spacing: 0.4px;"
-        )
-        sun_header_row.addWidget(self.sun_badge_label)
-        sun_header_row.addStretch(1)
-
-        self.btn_focus_sun = QPushButton("Focus Core")
-        self.btn_focus_sun.setObjectName("SubtleBtn")
-        self.btn_focus_sun.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_focus_sun.setFixedHeight(24)
-        self.btn_focus_sun.setToolTip("Center the canvas on the central Project Core node")
-        self.btn_focus_sun.clicked.connect(self.canvas.focus_on_sun)
-        sun_header_row.addWidget(self.btn_focus_sun)
-        sun_card_layout.addLayout(sun_header_row)
-
-        self.sun_title_display = QLabel("")
-        self.sun_title_display.setStyleSheet(
-            "color: #F8FAFC; font-weight: 700; font-size: 14px;"
-        )
-        self.sun_title_display.setWordWrap(True)
-        sun_card_layout.addWidget(self.sun_title_display)
-
-        # Counterparts of the same project in other application sources (Cross-App Switcher)
-        self.related_sources_widget = QWidget()
-        self.related_sources_layout = QHBoxLayout(self.related_sources_widget)
-        self.related_sources_layout.setContentsMargins(0, 0, 0, 0)
-        self.related_sources_layout.setSpacing(6)
-        self.related_sources_widget.setVisible(False)
-        sun_card_layout.addWidget(self.related_sources_widget)
-
-        self.sun_plan_preview = QTextEdit()
-        self.sun_plan_preview.setReadOnly(True)
-        self.sun_plan_preview.setMaximumHeight(150)
-        self.sun_plan_preview.setStyleSheet(
-            "background-color: #0D1117; color: #CBD5E1; border: 1px solid #1E2633; font-size: 11.5px;"
-        )
-        sun_card_layout.addWidget(self.sun_plan_preview)
-
-        # Quick project actions row: Enhance with Ollama | Open Folder | Copy Prompt
-        sun_actions_row = QHBoxLayout()
-        sun_actions_row.setSpacing(6)
-
-        ollama_btn_label = (
-            f"Enhance with Ollama ({self._detected_ollama_model})"
-            if self._detected_ollama_model
-            else "Enhance with Ollama"
-        )
-        self.btn_ollama_single = QPushButton(ollama_btn_label)
-        self.btn_ollama_single.setObjectName("OllamaBtn")
-        self.btn_ollama_single.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ollama_single.setFixedHeight(26)
-        self.btn_ollama_single.setToolTip(
-            "Use the local Ollama model to verify and enrich this project's core summary"
-        )
-        self.btn_ollama_single.clicked.connect(self._enhance_active_project_with_ollama)
-        sun_actions_row.addWidget(self.btn_ollama_single, stretch=1)
-
-        self.btn_open_workspace = QPushButton("Open Folder")
-        self.btn_open_workspace.setObjectName("SubtleBtn")
-        self.btn_open_workspace.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open_workspace.setFixedHeight(26)
-        self.btn_open_workspace.setToolTip("Open the project's local workspace folder")
-        self.btn_open_workspace.clicked.connect(
-            lambda: self._open_node_path(self.canvas.active_system)
-        )
-        sun_actions_row.addWidget(self.btn_open_workspace)
-
-        self.btn_copy_prompt = QPushButton("Copy Prompt")
-        self.btn_copy_prompt.setObjectName("SubtleBtn")
-        self.btn_copy_prompt.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_copy_prompt.setFixedHeight(26)
-        self.btn_copy_prompt.setToolTip(
-            "Copy the project purpose, architectural layers, and sub-components to the clipboard as an AI prompt"
-        )
-        self.btn_copy_prompt.clicked.connect(
-            lambda: self._copy_project_as_prompt(self.canvas.active_system)
-        )
-        sun_actions_row.addWidget(self.btn_copy_prompt)
-
-        sun_card_layout.addLayout(sun_actions_row)
-        side_layout.addWidget(self.sun_card)
-
-        # B) Guided Architecture Tour Card
-        self.tour_card = QFrame()
-        self.tour_card.setObjectName("TourCard")
-        self.tour_card.setVisible(False)
-        tour_layout = QHBoxLayout(self.tour_card)
-        tour_layout.setContentsMargins(10, 8, 10, 8)
-        self.tour_status_label = QLabel("Architecture Tour: Step 1/1")
-        self.tour_status_label.setStyleSheet("color: #93C5FD; font-weight: 600; font-size: 11px;")
-        tour_layout.addWidget(self.tour_status_label, stretch=1)
-
-        btn_next_tour = QPushButton("Next Step →")
-        btn_next_tour.setFixedHeight(24)
-        btn_next_tour.clicked.connect(self._on_tour_clicked)
-        tour_layout.addWidget(btn_next_tour)
-
-        btn_stop_tour = QPushButton("Close")
-        btn_stop_tour.setObjectName("SubtleBtn")
-        btn_stop_tour.setFixedHeight(24)
-        btn_stop_tour.clicked.connect(self._stop_tour)
-        tour_layout.addWidget(btn_stop_tour)
-        side_layout.addWidget(self.tour_card)
-
-        # C) Selected Item Detail & Editor Card
-        self.detail_card = QFrame()
-        self.detail_card.setObjectName("DetailCard")
-        detail_layout = QVBoxLayout(self.detail_card)
-        detail_layout.setContentsMargins(12, 12, 12, 12)
-        detail_layout.setSpacing(8)
-
-        inspector_header_row = QHBoxLayout()
-        self.inspector_type_badge = QLabel("SELECTED ITEM")
-        self.inspector_type_badge.setObjectName("SectionHeader")
-        inspector_header_row.addWidget(self.inspector_type_badge, stretch=1)
-
-        self.btn_link_planet = QPushButton("+ Add Link (Arrow)")
-        self.btn_link_planet.setObjectName("SubtleBtn")
-        self.btn_link_planet.setFixedHeight(22)
-        self.btn_link_planet.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_link_planet.setVisible(False)
-        self.btn_link_planet.clicked.connect(self._prompt_add_link_from_selected)
-        inspector_header_row.addWidget(self.btn_link_planet)
-
-        self.btn_open_file = QPushButton("Open File")
-        self.btn_open_file.setObjectName("SubtleBtn")
-        self.btn_open_file.setFixedHeight(22)
-        self.btn_open_file.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open_file.setVisible(False)
-        self.btn_open_file.clicked.connect(lambda: self._open_node_path(self._selected_node))
-        inspector_header_row.addWidget(self.btn_open_file)
-
-        detail_layout.addLayout(inspector_header_row)
-
-        lbl_title = QLabel("Title:")
-        lbl_title.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        detail_layout.addWidget(lbl_title)
-
-        self.edit_title = QLineEdit()
-        self.edit_title.setPlaceholderText("Enter title...")
-        detail_layout.addWidget(self.edit_title)
-
-        self.meta_row_widget = QWidget()
-        meta_row_layout = QHBoxLayout(self.meta_row_widget)
-        meta_row_layout.setContentsMargins(0, 0, 0, 0)
-        self.lbl_meta = QLabel("Category / Tag:")
-        self.lbl_meta.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        self.combo_meta = QComboBox()
-        meta_row_layout.addWidget(self.lbl_meta)
-        meta_row_layout.addWidget(self.combo_meta, stretch=1)
-        detail_layout.addWidget(self.meta_row_widget)
-
-        self.lbl_links_info = QLabel("")
-        self.lbl_links_info.setWordWrap(True)
-        self.lbl_links_info.setStyleSheet(
-            "color: #94A3B8; font-size: 11px; background-color: #0D1117; "
-            "padding: 6px 8px; border-radius: 5px; border: 1px solid #1E2633;"
-        )
-        self.lbl_links_info.setVisible(False)
-        detail_layout.addWidget(self.lbl_links_info)
-
-        self.lbl_content_header = QLabel("Project Purpose / Architectural Description / Details:")
-        self.lbl_content_header.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        detail_layout.addWidget(self.lbl_content_header)
-
-        self.edit_content = QTextEdit()
-        self.edit_content.setPlaceholderText(
-            "Project purpose, architectural decisions, code summary, or detailed notes..."
-        )
-        detail_layout.addWidget(self.edit_content, stretch=1)
-
-        action_row = QHBoxLayout()
-        self.btn_save_node = QPushButton("Save Changes")
-        self.btn_save_node.setObjectName("PrimaryBtn")
-        self.btn_save_node.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_save_node.clicked.connect(self._save_current_node)
-        action_row.addWidget(self.btn_save_node, stretch=1)
-
-        self.btn_delete_node = QPushButton("Delete")
-        self.btn_delete_node.setObjectName("DangerBtn")
-        self.btn_delete_node.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete_node.clicked.connect(self._delete_current_node)
-        action_row.addWidget(self.btn_delete_node)
-
-        detail_layout.addLayout(action_row)
-        side_layout.addWidget(self.detail_card, stretch=1)
-
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(0)
+        self._build_project_header(side_layout)
+        self._build_inspector_body(side_layout)
         splitter.addWidget(side_panel)
-        splitter.setSizes([285, 845, 430])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        left_w = self._int_setting("sidebar_width", 260, 220, 400)
+        right_w = self._int_setting("inspector_width", 390, 340, 620)
+        splitter.setSizes([left_w, max(400, 1560 - left_w - right_w), right_w])
+        self._splitter_save_timer = QTimer(self)
+        self._splitter_save_timer.setSingleShot(True)
+        self._splitter_save_timer.setInterval(500)
+        self._splitter_save_timer.timeout.connect(self._save_splitter_sizes)
+        splitter.splitterMoved.connect(lambda *_: self._splitter_save_timer.start())
 
-        # Main Central Stack (Index 0: Studio & Canvas, Index 1: Full-Window AI Integrations View)
+        # Central stack (0: studio, 1: integrations page)
         self.central_stack = QStackedWidget()
         self.central_stack.addWidget(splitter)
-
         self.connections_view = AIConnectionsView(
             store=self.store,
             parent=self,
@@ -2042,151 +2072,666 @@ class HeliosMainWindow(QMainWindow):
             on_cancel=self._on_connections_cancelled,
         )
         self.central_stack.addWidget(self.connections_view)
-
         root_layout.addWidget(self.central_stack, stretch=1)
 
+        # ---------------------------------------------------------------
+        # 3. Status bar (stays enabled while a worker is busy)
+        # ---------------------------------------------------------------
+        status_bar = QFrame()
+        status_bar.setObjectName("StatusBar")
+        status_bar.setFixedHeight(28)
+        sb_lay = QHBoxLayout(status_bar)
+        sb_lay.setContentsMargins(12, 0, 12, 0)
+        sb_lay.setSpacing(8)
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setObjectName("BusyBar")
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedWidth(72)
+        self.busy_bar.setVisible(False)
+        sb_lay.addWidget(self.busy_bar)
+        self.status_label = ElidedLabel("Click a project to open it · drag to pan · scroll to zoom")
+        self.status_label.setObjectName("StatusHint")
+        theme.set_role(self.status_label, "caption")
+        sb_lay.addWidget(self.status_label, stretch=1)
+        self.btn_status_stop = QPushButton("Stop")
+        self.btn_status_stop.setObjectName("LinkBtn")
+        self.btn_status_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_status_stop.setToolTip("Stop Ollama (results written so far are kept)")
+        self.btn_status_stop.clicked.connect(self._stop_ollama)
+        self.btn_status_stop.setVisible(False)
+        sb_lay.addWidget(self.btn_status_stop)
+        self.lbl_skipped_link = QLabel("")
+        self.lbl_skipped_link.setObjectName("SkippedLink")
+        theme.set_role(self.lbl_skipped_link, "caption")
+        self.lbl_skipped_link.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_skipped_link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse
+                                                      | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.lbl_skipped_link.setOpenExternalLinks(False)
+        self.lbl_skipped_link.linkActivated.connect(lambda *_: self._show_skipped_folders_dialog())
+        self.lbl_skipped_link.setVisible(False)
+        sb_lay.addWidget(self.lbl_skipped_link)
+        self.lbl_ollama_status = ElidedLabel("")
+        theme.set_role(self.lbl_ollama_status, "muted")
+        self.lbl_ollama_status.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.lbl_ollama_status.setFixedWidth(220)
+        self.lbl_ollama_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sb_lay.addWidget(self.lbl_ollama_status)
+        root_layout.addWidget(status_bar)
+        self.status_bar = status_bar
+
+        # Disabled as a group while a background worker owns the store (status bar stays live).
+        self._busy_lock_widgets = [top_bar, left_sidebar, self.canvas, side_panel]
+
+        # Mouse clicks don't leave focus rings on buttons; keyboard (Tab) focus still shows them.
+        for btn in self.findChildren(QAbstractButton):
+            btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+
     # ------------------------------------------------------------------
-    # Left Tree, Breadcrumb & Pinned Project Summary Card
+    # Inspector construction
+    # ------------------------------------------------------------------
+    def _build_project_header(self, side_layout: QVBoxLayout) -> None:
+        self.sun_card = QFrame()
+        self.sun_card.setObjectName("ProjectHeader")
+        lay = QVBoxLayout(self.sun_card)
+        lay.setContentsMargins(18, 14, 18, 12)
+        lay.setSpacing(6)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(4)
+        self.sun_title_display = ElidedLabel("")
+        theme.set_role(self.sun_title_display, "title")
+        title_row.addWidget(self.sun_title_display, 1)
+        self.btn_project_more = QPushButton("…")
+        self.btn_project_more.setObjectName("QuietBtn")
+        self.btn_project_more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_project_more.setToolTip("More project actions")
+        self.btn_project_more.setFixedWidth(34)
+        self.btn_project_more.clicked.connect(self._show_project_more_menu)
+        title_row.addWidget(self.btn_project_more, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(title_row)
+        self._build_purpose_block(lay)
+        self._build_identity_line(lay)
+
+        self.project_chips_widget = QWidget()
+        self.project_chips_widget.setObjectName("Transparent")
+        self.project_chips_layout = QHBoxLayout(self.project_chips_widget)
+        self.project_chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.project_chips_layout.setSpacing(6)
+        lay.addWidget(self.project_chips_widget)
+
+        self.lbl_project_counts = theme.label("", "caption")
+        lay.addWidget(self.lbl_project_counts)
+
+        # Counterparts of the same project from other sources.
+        self.related_sources_widget = QWidget()
+        self.related_sources_widget.setObjectName("Transparent")
+        self.related_sources_layout = QHBoxLayout(self.related_sources_widget)
+        self.related_sources_layout.setContentsMargins(0, 0, 0, 0)
+        self.related_sources_layout.setSpacing(6)
+        self.related_sources_widget.setVisible(False)
+        lay.addWidget(self.related_sources_widget)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(-6, 2, 0, 0)
+        actions.setSpacing(2)
+        self.btn_ollama_single = QPushButton(self._ollama_button_label())
+        self.btn_ollama_single.setObjectName("OllamaBtn")
+        self.btn_ollama_single.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_ollama_button_tooltip()
+        self.btn_ollama_single.clicked.connect(self._on_ollama_button_clicked)
+        actions.addWidget(self.btn_ollama_single)
+        self.btn_open_workspace = QPushButton("Open folder")
+        self.btn_open_workspace.setObjectName("QuietBtn")
+        self.btn_open_workspace.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_workspace.setToolTip("Open the project's folder")
+        self.btn_open_workspace.clicked.connect(lambda: self._open_node_path(self.canvas.active_system))
+        actions.addWidget(self.btn_open_workspace)
+        self.btn_copy_prompt = QPushButton("Copy prompt")
+        self.btn_copy_prompt.setObjectName("QuietBtn")
+        self.btn_copy_prompt.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy_prompt.setToolTip("Copy the project overview, modules and links as a prompt for an AI assistant")
+        self.btn_copy_prompt.clicked.connect(lambda: self._copy_project_as_prompt(self.canvas.active_system))
+        actions.addWidget(self.btn_copy_prompt)
+        actions.addStretch(1)
+        lay.addLayout(actions)
+        side_layout.addWidget(self.sun_card)
+
+        # Guided tour strip (only while touring)
+        self.tour_card = QFrame()
+        self.tour_card.setObjectName("TourCard")
+        self.tour_card.setVisible(False)
+        tour_layout = QHBoxLayout(self.tour_card)
+        tour_layout.setContentsMargins(12, 6, 8, 6)
+        tour_layout.setSpacing(6)
+        self.tour_status_label = ElidedLabel("Tour")
+        theme.set_role(self.tour_status_label, "warn")
+        tour_layout.addWidget(self.tour_status_label, stretch=1)
+        btn_next_tour = QPushButton("Next")
+        btn_next_tour.setObjectName("QuietBtn")
+        btn_next_tour.clicked.connect(self._on_tour_clicked)
+        tour_layout.addWidget(btn_next_tour)
+        btn_stop_tour = QPushButton("Close")
+        btn_stop_tour.setObjectName("QuietBtn")
+        btn_stop_tour.clicked.connect(self._stop_tour)
+        tour_layout.addWidget(btn_stop_tour)
+        tour_wrap = QWidget()
+        tour_wrap.setObjectName("Transparent")
+        tw_lay = QVBoxLayout(tour_wrap)
+        tw_lay.setContentsMargins(12, 8, 12, 0)
+        tw_lay.addWidget(self.tour_card)
+        side_layout.addWidget(tour_wrap)
+
+    def _build_purpose_block(self, lay: QVBoxLayout) -> None:
+        """What the project is for: text + source tag, a placeholder with actions, an inline editor."""
+        self.purpose_view = QWidget()
+        self.purpose_view.setObjectName("Transparent")
+        pv = QVBoxLayout(self.purpose_view)
+        pv.setContentsMargins(0, 0, 0, 2)
+        pv.setSpacing(2)
+        self.lbl_purpose = ClampedLabel("", max_lines=theme.PURPOSE_MAX_LINES)
+        self.lbl_purpose.setObjectName("PurposeText")
+        self.lbl_purpose.setCursor(Qt.CursorShape.IBeamCursor)
+        self.lbl_purpose.idle_tooltip = "Click to edit what this project is for"
+        self.lbl_purpose.clicked.connect(lambda: self._begin_purpose_edit())
+        pv.addWidget(self.lbl_purpose)
+        self.lbl_purpose_source = theme.label("", "muted")
+        pv.addWidget(self.lbl_purpose_source)
+        lay.addWidget(self.purpose_view)
+
+        # An AI suggestion waiting for the user: a separate tinted box, never the purpose.
+        self.suggestion_box = QFrame()
+        self.suggestion_box.setObjectName("SuggestionBox")
+        sb = QVBoxLayout(self.suggestion_box)
+        sb.setContentsMargins(10, 7, 10, 6)
+        sb.setSpacing(4)
+        self.lbl_suggestion_tag = QLabel("Suggested")
+        self.lbl_suggestion_tag.setObjectName("SuggestionTag")
+        self.lbl_suggestion_tag.setToolTip(
+            "Written by the local AI model from what was collected about this project. "
+            "It is not the project's purpose until you accept it."
+        )
+        sb_head = QHBoxLayout()
+        sb_head.setContentsMargins(0, 0, 0, 0)
+        sb_head.addWidget(self.lbl_suggestion_tag)
+        sb_head.addStretch(1)
+        sb.addLayout(sb_head)
+        # Shown in full (at most 2 sentences / 400 characters): never elided, so the user
+        # can read everything they accept.
+        self.lbl_suggestion = theme.label("", "", wrap=True)
+        self.lbl_suggestion.setObjectName("SuggestionText")
+        self.lbl_suggestion.setTextFormat(Qt.TextFormat.PlainText)
+        self.lbl_suggestion.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_suggestion.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sb.addWidget(self.lbl_suggestion)
+        sb_actions = QHBoxLayout()
+        sb_actions.setContentsMargins(0, 2, 0, 0)
+        sb_actions.setSpacing(4)
+        self.btn_suggestion_accept = QPushButton("Accept")
+        self.btn_suggestion_edit = QPushButton("Edit")
+        self.btn_suggestion_dismiss = QPushButton("Dismiss")
+        for btn, tip, slot in (
+            (self.btn_suggestion_accept, "Use this sentence as the project's purpose", self._accept_purpose_suggestion),
+            (self.btn_suggestion_edit, "Change the sentence before keeping it as your own", self._edit_purpose_suggestion),
+            (self.btn_suggestion_dismiss, "Remove the suggestion (not suggested again unless the project changes)",
+             self._dismiss_purpose_suggestion),
+        ):
+            btn.setObjectName("SuggestionBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda checked=False, f=slot: f())
+            sb_actions.addWidget(btn)
+        sb_actions.addStretch(1)
+        sb.addLayout(sb_actions)
+        self.suggestion_box.setVisible(False)
+        lay.addWidget(self.suggestion_box)
+
+        # Neither a purpose nor a suggestion: one muted line that opens the editor.
+        self.purpose_empty = QWidget()
+        self.purpose_empty.setObjectName("Transparent")
+        pe = QHBoxLayout(self.purpose_empty)
+        pe.setContentsMargins(0, 0, 0, 2)
+        pe.setSpacing(12)
+        self.btn_purpose_add = QPushButton("Add what this project is for")
+        self.btn_purpose_add.setObjectName("PurposeAddBtn")
+        self.btn_purpose_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_purpose_add.setToolTip("Describe in a sentence or two what this project is for")
+        self.btn_purpose_add.clicked.connect(lambda checked=False: self._begin_purpose_edit())
+        pe.addWidget(self.btn_purpose_add)
+        self.btn_suggest_ai = QPushButton("Suggest with AI")
+        self.btn_suggest_ai.setObjectName("LinkBtn")
+        self.btn_suggest_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_suggest_ai.clicked.connect(lambda checked=False: self._suggest_purpose_with_ai(self.canvas.active_system))
+        self.btn_suggest_ai.setVisible(False)
+        pe.addWidget(self.btn_suggest_ai)
+        pe.addStretch(1)
+        lay.addWidget(self.purpose_empty)
+
+        self.purpose_edit_box = QWidget()
+        self.purpose_edit_box.setObjectName("Transparent")
+        ed = QVBoxLayout(self.purpose_edit_box)
+        ed.setContentsMargins(0, 2, 0, 4)
+        ed.setSpacing(6)
+        self.edit_purpose = PurposeEditor()
+        self.edit_purpose.saveRequested.connect(self._save_purpose_edit)
+        self.edit_purpose.cancelRequested.connect(self._cancel_purpose_edit)
+        ed.addWidget(self.edit_purpose)
+        ed_row = QHBoxLayout()
+        ed_row.setContentsMargins(0, 0, 0, 0)
+        ed_row.setSpacing(6)
+        self.btn_purpose_save = QPushButton("Save")
+        self.btn_purpose_save.setObjectName("SecondaryBtn")
+        self.btn_purpose_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_purpose_save.setToolTip("Save (Ctrl+Enter)")
+        self.btn_purpose_save.clicked.connect(lambda checked=False: self._save_purpose_edit())
+        ed_row.addWidget(self.btn_purpose_save)
+        self.btn_purpose_cancel = QPushButton("Cancel")
+        self.btn_purpose_cancel.setObjectName("QuietBtn")
+        self.btn_purpose_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_purpose_cancel.setToolTip("Cancel (Esc)")
+        self.btn_purpose_cancel.clicked.connect(lambda checked=False: self._cancel_purpose_edit())
+        ed_row.addWidget(self.btn_purpose_cancel)
+        ed_row.addStretch(1)
+        ed_row.addWidget(theme.label("Ctrl+Enter saves · Esc cancels", "muted"))
+        ed.addLayout(ed_row)
+        self.purpose_edit_box.setVisible(False)
+        lay.addWidget(self.purpose_edit_box)
+        self._purpose_edit_target: Optional[SolarSystem] = None
+        self._evidence_viewer: Optional[QDialog] = None
+
+    def _build_identity_line(self, lay: QVBoxLayout) -> None:
+        """What the project IS (``SolarSystem.identity``): a muted, read-only fact line under
+        the purpose block (also shown when the purpose is empty). Never labelled "Purpose"."""
+        self.lbl_identity = theme.label("", "", wrap=True)
+        self.lbl_identity.setObjectName("IdentityLine")
+        self.lbl_identity.setTextFormat(Qt.TextFormat.PlainText)
+        self.lbl_identity.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_identity.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_identity.setContentsMargins(0, 2, 0, 2)
+        self.lbl_identity.setToolTip(codebase_importer_module.IDENTITY_TOOLTIP)
+        self.lbl_identity.setVisible(False)
+        lay.addWidget(self.lbl_identity)
+
+    def _refresh_identity_line(self, sys_obj: Optional[SolarSystem]) -> None:
+        if not hasattr(self, "lbl_identity"):
+            return
+        text = codebase_importer_module.stored_identity(sys_obj) if sys_obj is not None else ""
+        self.lbl_identity.setText(text)
+        self.lbl_identity.setVisible(bool(text))
+
+    def _build_inspector_body(self, side_layout: QVBoxLayout) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        self.inspector_scroll = scroll
+        body = QWidget()
+        body.setObjectName("InspectorBody")
+        self.detail_card = body
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(18, 14, 18, 18)
+        body_lay.setSpacing(10)
+
+        # Selection header: kind chips, title, subtitle, actions
+        self.sel_chips_widget = QWidget()
+        self.sel_chips_widget.setObjectName("Transparent")
+        self.sel_chips_layout = QHBoxLayout(self.sel_chips_widget)
+        self.sel_chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.sel_chips_layout.setSpacing(6)
+        body_lay.addWidget(self.sel_chips_widget)
+        self.inspector_type_badge = self.sel_chips_widget  # compatibility alias
+
+        self.sel_title = theme.label("", "heading", wrap=True)
+        self.sel_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.sel_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body_lay.addWidget(self.sel_title)
+        self.sel_subtitle = theme.label("", "caption", wrap=True)
+        self.sel_subtitle.setTextFormat(Qt.TextFormat.PlainText)
+        body_lay.addWidget(self.sel_subtitle)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(-6, 0, 0, 0)
+        actions.setSpacing(2)
+        self.btn_open_file = QPushButton("Open file")
+        self.btn_open_file.setObjectName("QuietBtn")
+        self.btn_open_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_file.setVisible(False)
+        self.btn_open_file.clicked.connect(lambda: self._open_node_path(self._selected_node))
+        actions.addWidget(self.btn_open_file)
+        self.btn_link_planet = QPushButton("Add link")
+        self.btn_link_planet.setObjectName("QuietBtn")
+        self.btn_link_planet.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_link_planet.setToolTip("Link this module to another one")
+        self.btn_link_planet.setVisible(False)
+        self.btn_link_planet.clicked.connect(self._prompt_add_link_from_selected)
+        actions.addWidget(self.btn_link_planet)
+        self.btn_edit_toggle = QPushButton("Edit")
+        self.btn_edit_toggle.setObjectName("QuietBtn")
+        self.btn_edit_toggle.setCheckable(True)
+        self.btn_edit_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_edit_toggle.setToolTip("Edit the name, colour and description")
+        self.btn_edit_toggle.toggled.connect(self._set_edit_section_open)
+        self.btn_edit_toggle.setVisible(False)
+        actions.addWidget(self.btn_edit_toggle)
+        self.btn_quick_delete = QPushButton("Delete")
+        self.btn_quick_delete.setObjectName("DangerBtn")
+        self.btn_quick_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_quick_delete.setVisible(False)
+        self.btn_quick_delete.clicked.connect(self._delete_current_node)
+        actions.addWidget(self.btn_quick_delete)
+        actions.addStretch(1)
+        body_lay.addLayout(actions)
+
+        # Read-only AI description of a module (PlanetNode.ai_summary), kept apart from the
+        # editable summary; never saved into `summary`.
+        self.ai_summary_box = QFrame()
+        self.ai_summary_box.setObjectName("AiSummaryBox")
+        ai_box_layout = QVBoxLayout(self.ai_summary_box)
+        ai_box_layout.setContentsMargins(12, 8, 8, 10)
+        ai_box_layout.setSpacing(4)
+        ai_head_row = QHBoxLayout()
+        self.lbl_ai_summary_header = theme.label("AI description (Ollama — may be inaccurate)", "caption")
+        ai_head_row.addWidget(self.lbl_ai_summary_header, stretch=1)
+        self.btn_clear_ai_summary = QPushButton("Clear")
+        self.btn_clear_ai_summary.setObjectName("QuietBtn")
+        self.btn_clear_ai_summary.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_ai_summary.setToolTip("Remove the AI-written description of this module")
+        self.btn_clear_ai_summary.clicked.connect(self._clear_selected_ai_summary)
+        ai_head_row.addWidget(self.btn_clear_ai_summary)
+        ai_box_layout.addLayout(ai_head_row)
+        self.lbl_ai_summary = theme.label("", "body", wrap=True)
+        self.lbl_ai_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.lbl_ai_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_ai_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        ai_box_layout.addWidget(self.lbl_ai_summary)
+        self.ai_summary_box.setVisible(False)
+        body_lay.addWidget(self.ai_summary_box)
+
+        # Selection-dependent sections (About, Uses, Used by, Contains, Calls …)
+        self.sections_widget = QWidget()
+        self.sections_widget.setObjectName("Transparent")
+        self.sections_layout = QVBoxLayout(self.sections_widget)
+        self.sections_layout.setContentsMargins(0, 0, 0, 0)
+        self.sections_layout.setSpacing(4)
+        body_lay.addWidget(self.sections_widget)
+
+        # Edit section (collapsed by default)
+        self.edit_section = QFrame()
+        self.edit_section.setObjectName("EditSection")
+        ed = QVBoxLayout(self.edit_section)
+        ed.setContentsMargins(14, 12, 14, 14)
+        ed.setSpacing(6)
+        ed.addWidget(theme.label("Edit", "section"))
+        self.lbl_title_field = theme.label("Name", "caption")
+        ed.addWidget(self.lbl_title_field)
+        self.edit_title = QLineEdit()
+        self.edit_title.setPlaceholderText("Name")
+        self.edit_title.textEdited.connect(self._mark_edit_dirty)
+        ed.addWidget(self.edit_title)
+        self.meta_row_widget = QWidget()
+        self.meta_row_widget.setObjectName("Transparent")
+        meta_row_layout = QVBoxLayout(self.meta_row_widget)
+        meta_row_layout.setContentsMargins(0, 4, 0, 0)
+        meta_row_layout.setSpacing(6)
+        self.lbl_meta = theme.label("Colour", "caption")
+        self.combo_meta = QComboBox()
+        self.combo_meta.activated.connect(self._mark_edit_dirty)
+        meta_row_layout.addWidget(self.lbl_meta)
+        meta_row_layout.addWidget(self.combo_meta)
+        ed.addWidget(self.meta_row_widget)
+        self.lbl_content_header = theme.label("Description", "caption")
+        self.lbl_content_header.setContentsMargins(0, 4, 0, 0)
+        ed.addWidget(self.lbl_content_header)
+        self.edit_content = QTextEdit()
+        self.edit_content.setAcceptRichText(False)
+        self.edit_content.setMinimumHeight(170)
+        self.edit_content.setPlaceholderText("What it does and how it works…")
+        self.edit_content.textChanged.connect(self._mark_edit_dirty)
+        ed.addWidget(self.edit_content)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        self.btn_save_node = QPushButton("Save")
+        self.btn_save_node.setObjectName("SecondaryBtn")
+        self.btn_save_node.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_node.clicked.connect(self._save_current_node)
+        action_row.addWidget(self.btn_save_node)
+        self.btn_cancel_edit = QPushButton("Cancel")
+        self.btn_cancel_edit.setObjectName("QuietBtn")
+        self.btn_cancel_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel_edit.clicked.connect(self._cancel_edit)
+        action_row.addWidget(self.btn_cancel_edit)
+        action_row.addStretch(1)
+        self.btn_delete_node = QPushButton("Delete")
+        self.btn_delete_node.setObjectName("DangerBtn")
+        self.btn_delete_node.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete_node.clicked.connect(self._delete_current_node)
+        action_row.addWidget(self.btn_delete_node)
+        ed.addLayout(action_row)
+        self.edit_section.setVisible(False)
+        body_lay.addWidget(self.edit_section)
+        body_lay.addStretch(1)
+
+        scroll.setWidget(body)
+        side_layout.addWidget(scroll, stretch=1)
+
+    # ------------------------------------------------------------------
+    # Small UI helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sun_pixmap(size: int) -> QPixmap:
+        pm = QPixmap(size * 2, size * 2)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(theme.qcolor(theme.ACCENT, 60)))
+        p.drawEllipse(0, 0, size, size)
+        p.setBrush(QBrush(theme.qcolor(theme.ACCENT)))
+        inset = size * 0.22
+        p.drawEllipse(int(inset), int(inset), int(size - 2 * inset), int(size - 2 * inset))
+        p.end()
+        return pm
+
+    def _dot_icon(self, hex_color: str, hollow: bool = False) -> QIcon:
+        key = f"{hex_color}|{hollow}"
+        cached = self._dot_icon_cache.get(key)
+        if cached is not None:
+            return cached
+        size = 10
+        pm = QPixmap(size * 2, size * 2)
+        pm.setDevicePixelRatio(2.0)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = theme.soft_color(hex_color)
+        if hollow:
+            p.setPen(QPen(color, 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(2, 2, 6, 6)
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(1, 1, 8, 8)
+        p.end()
+        icon = QIcon(pm)
+        self._dot_icon_cache[key] = icon
+        return icon
+
+    def _int_setting(self, key: str, default: int, lo: int, hi: int) -> int:
+        try:
+            value = int(self.store.get_setting(key, default) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(lo, min(hi, value))
+
+    def _save_splitter_sizes(self) -> None:
+        sizes = self.main_splitter.sizes()
+        if len(sizes) == 3 and sizes[0] > 0 and sizes[2] > 0:
+            try:
+                self.store.set_setting("sidebar_width", int(sizes[0]))
+                self.store.set_setting("inspector_width", int(sizes[2]))
+            except Exception:
+                pass
+
+    def canvas_show_all_details_setting(self) -> bool:
+        return bool(self.store.get_setting("canvas_show_all_details", False))
+
+    def _toggle_show_all_details(self) -> None:
+        self.canvas.set_show_all_details(self.btn_show_details.isChecked())
+        self.status_label.setText(
+            "Showing every module's components." if self.canvas.show_all_details
+            else "Components are shown for the selected or hovered module."
+        )
+
+    def _on_show_all_details_changed(self, enabled: bool) -> None:
+        if self.btn_show_details.isChecked() != enabled:
+            self.btn_show_details.setChecked(enabled)
+
+    def _on_project_crumb_clicked(self) -> None:
+        if self.canvas.active_system is None:
+            return
+        if self.canvas.view_mode != "system":
+            self.canvas.enter_solar_system(self.canvas.active_system)
+        else:
+            self.canvas.focus_on_sun()
+
+    # ------------------------------------------------------------------
+    # Left tree, breadcrumb & project header
     # ------------------------------------------------------------------
     def _update_group_toggle_styles(self) -> None:
-        active_style = (
-            "background-color: #2563EB; color: #FFFFFF; font-weight: 700; "
-            "border: none; border-radius: 4px; font-size: 11px;"
-        )
-        inactive_style = (
-            "background-color: #1E293B; color: #94A3B8; font-weight: 500; "
-            "border: 1px solid #334155; border-radius: 4px; font-size: 11px;"
-        )
-        if getattr(self, "tree_group_mode", "project") == "project":
-            self.btn_group_by_project.setStyleSheet(active_style)
-            self.btn_group_by_source.setStyleSheet(inactive_style)
-        else:
-            self.btn_group_by_project.setStyleSheet(inactive_style)
-            self.btn_group_by_source.setStyleSheet(active_style)
+        mode = getattr(self, "tree_group_mode", "project")
+        self.btn_group_by_project.setChecked(mode == "project")
+        self.btn_group_by_source.setChecked(mode != "project")
 
     def _populate_system_nodes_in_tree(self, sys_item: QTreeWidgetItem, sys_obj: SolarSystem) -> None:
-        """Populates modules (planets), sub-components (satellites), links, and notes under a project tree item."""
+        """Adds modules, components, links and notes under a project item."""
+        secondary = QBrush(theme.qcolor(theme.TEXT_2))
         for planet in sys_obj.planets:
             p_item = QTreeWidgetItem(sys_item, [planet.title])
             p_item.setData(0, Qt.ItemDataRole.UserRole, ("planet", planet))
-            p_item.setForeground(0, QBrush(QColor("#CBD5E1")))
-
+            p_item.setIcon(0, self._dot_icon(planet.color, hollow=planet.kind in ("history", "external")))
+            p_item.setToolTip(0, f"{planet.title}\n{theme.PLANET_KIND_LABELS.get(planet.kind, 'Module')}")
             for sat in planet.satellites:
-                s_item = QTreeWidgetItem(p_item, [f"• {sat.title}"])
+                s_item = QTreeWidgetItem(p_item, [sat.title])
                 s_item.setData(0, Qt.ItemDataRole.UserRole, ("satellite", sat))
-                s_item.setForeground(0, QBrush(QColor("#94A3B8")))
+                s_item.setForeground(0, secondary)
+                s_item.setToolTip(0, sat.title)
 
-        # Data Flows (Links)
         if sys_obj.links:
-            links_root = QTreeWidgetItem(sys_item, [f"Data Flows ({len(sys_obj.links)})"])
+            links_root = QTreeWidgetItem(sys_item, [f"Links ({len(sys_obj.links)})"])
             links_root.setData(0, Qt.ItemDataRole.UserRole, ("links_group", sys_obj))
-            links_root.setForeground(0, QBrush(QColor("#60A5FA")))
+            links_root.setForeground(0, secondary)
             p_map = {p.id: p.title for p in sys_obj.planets}
             for link in sys_obj.links:
                 src_t = p_map.get(link.source_planet_id, "?")
                 dst_t = p_map.get(link.target_planet_id, "?")
-                l_item = QTreeWidgetItem(links_root, [f"→ {src_t} › {dst_t} ({link.label})"])
+                l_item = QTreeWidgetItem(links_root, [f"{src_t} → {dst_t}"])
                 l_item.setData(0, Qt.ItemDataRole.UserRole, ("link", link))
-                l_item.setForeground(0, QBrush(QColor("#93C5FD")))
+                l_item.setForeground(0, secondary)
+                l_item.setToolTip(0, f"{src_t} → {dst_t}\n{link.label}")
 
-        # Architecture Notes
         if sys_obj.notes:
-            notes_root = QTreeWidgetItem(sys_item, [f"Architecture Notes ({len(sys_obj.notes)})"])
+            notes_root = QTreeWidgetItem(sys_item, [f"Notes ({len(sys_obj.notes)})"])
             notes_root.setData(0, Qt.ItemDataRole.UserRole, ("notes_group", sys_obj))
-            notes_root.setForeground(0, QBrush(QColor("#FBBF24")))
+            notes_root.setForeground(0, secondary)
             for note in sys_obj.notes:
-                n_item = QTreeWidgetItem(notes_root, [f"• {note.title}"])
+                n_item = QTreeWidgetItem(notes_root, [note.title])
                 n_item.setData(0, Qt.ItemDataRole.UserRole, ("note", note))
-                n_item.setForeground(0, QBrush(QColor("#FDE68A")))
+                n_item.setForeground(0, secondary)
+
+    def _project_tooltip(self, sys_obj: SolarSystem) -> str:
+        purpose = " ".join(str(getattr(sys_obj, "purpose", "") or "").split())
+        identity = codebase_importer_module.stored_identity(sys_obj)
+        identity_txt = f"\n{identity} ({codebase_importer_module.IDENTITY_TOOLTIP.lower()})" if identity else ""
+        return (
+            f"{sys_obj.project_name or sys_obj.name}\n"
+            f"{purpose or 'No description yet.'}{identity_txt}\n\n"
+            f"Sources: {sys_obj.get_source_labels()} · "
+            f"{len(sys_obj.planets)} modules · {len(sys_obj.links)} links"
+        )
+
+    def _refresh_project_tooltips(self) -> None:
+        """Updates the project rows' tooltips (purpose) without rebuilding the tree."""
+        def walk(item: QTreeWidgetItem) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "sun" and isinstance(data[1], SolarSystem):
+                item.setToolTip(0, self._project_tooltip(data[1]))
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        walk(self.hierarchy_tree.invisibleRootItem())
 
     def _populate_tree(self) -> None:
         self._updating_ui = True
         self.hierarchy_tree.clear()
-
         active_sys = self.canvas.active_system
         mode = getattr(self, "tree_group_mode", "project")
+        bold = QFont(theme.ui_font_family())
+        bold.setPixelSize(theme.FS_BODY)
+        bold.setWeight(QFont.Weight.DemiBold)
 
         if mode == "project":
-            # GROUP BY PROJECT (Counterparts across Antigravity, Claude Code, Codex, etc. unified under one heading)
             grouped_proj = self.store.grouped_by_project()
             for proj_name, sys_list in grouped_proj.items():
                 if not sys_list:
                     continue
-
                 if len(sys_list) == 1:
                     sys_obj = sys_list[0]
-                    sys_item = QTreeWidgetItem(
-                        self.hierarchy_tree,
-                        [f"{proj_name}  [{sys_obj.get_source_labels()}]"],
-                    )
+                    sys_item = QTreeWidgetItem(self.hierarchy_tree, [proj_name])
                     sys_item.setData(0, Qt.ItemDataRole.UserRole, ("sun", sys_obj))
-                    sys_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.Bold))
-                    sys_item.setForeground(0, QBrush(QColor("#F8FAFC")))
-
+                    sys_item.setFont(0, bold)
+                    sys_item.setIcon(0, self._dot_icon(str(get_source_meta(sys_obj.source)["color"])))
+                    sys_item.setToolTip(0, self._project_tooltip(sys_obj))
                     self._populate_system_nodes_in_tree(sys_item, sys_obj)
                     if sys_obj is active_sys:
                         sys_item.setExpanded(True)
                 else:
-                    # Multi-source / identically named projects (e.g., Antigravity + Codex / Claude)
-                    labels = " • ".join(s.get_source_labels() for s in sys_list)
-                    proj_item = QTreeWidgetItem(
-                        self.hierarchy_tree,
-                        [f"{proj_name}  [{labels}]"],
-                    )
+                    proj_item = QTreeWidgetItem(self.hierarchy_tree, [proj_name])
                     proj_item.setData(0, Qt.ItemDataRole.UserRole, ("project_group", (proj_name, sys_list)))
-                    proj_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.Bold))
-                    proj_item.setForeground(0, QBrush(QColor("#FBBF24")))
-
-                    has_active = False
+                    proj_item.setFont(0, bold)
+                    proj_item.setIcon(0, self._dot_icon(str(get_source_meta(sys_list[0].source)["color"])))
+                    proj_item.setToolTip(0, f"{proj_name}\nFrom {len(sys_list)} sources: "
+                                            + ", ".join(s.get_source_labels() for s in sys_list))
                     for sys_obj in sys_list:
                         cat_meta = get_source_meta(sys_obj.source)
                         src_item = QTreeWidgetItem(
-                            proj_item,
-                            [f"{cat_meta['title']} ({len(sys_obj.planets)} Modules)"],
+                            proj_item, [f"{cat_meta['short']} · {len(sys_obj.planets)} modules"]
                         )
                         src_item.setData(0, Qt.ItemDataRole.UserRole, ("sun", sys_obj))
-                        src_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-                        src_item.setForeground(0, QBrush(QColor(cat_meta["color"])))
-
+                        src_item.setIcon(0, self._dot_icon(str(cat_meta["color"])))
+                        src_item.setToolTip(0, self._project_tooltip(sys_obj))
                         self._populate_system_nodes_in_tree(src_item, sys_obj)
                         if sys_obj is active_sys:
-                            has_active = True
                             src_item.setExpanded(True)
-
                     proj_item.setExpanded(True)
-
         else:
-            # GROUP BY SOURCE (Antigravity, Codex, Codebase Analysis, etc.)
             grouped_src = self.store.grouped_by_source()
             for source_key, sys_list in grouped_src.items():
                 if not sys_list:
                     continue
-
                 cat_meta = get_source_meta(source_key)
-                cat_item = QTreeWidgetItem(
-                    self.hierarchy_tree,
-                    [f"{cat_meta['title']} ({len(sys_list)})"],
-                )
+                cat_item = QTreeWidgetItem(self.hierarchy_tree, [f"{cat_meta['title']}  ·  {len(sys_list)}"])
                 cat_item.setData(0, Qt.ItemDataRole.UserRole, ("category", source_key))
-                cat_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.Bold))
-                cat_item.setForeground(0, QBrush(QColor(cat_meta["color"])))
-
+                cat_item.setForeground(0, QBrush(theme.qcolor(theme.TEXT_2)))
+                cat_item.setIcon(0, self._dot_icon(str(cat_meta["color"])))
                 for sys_obj in sys_list:
                     display_proj = sys_obj.project_name or sys_obj.name
                     sys_item = QTreeWidgetItem(cat_item, [display_proj])
                     sys_item.setData(0, Qt.ItemDataRole.UserRole, ("sun", sys_obj))
-
+                    sys_item.setToolTip(0, self._project_tooltip(sys_obj))
                     if sys_obj is active_sys:
-                        sys_item.setFont(0, QFont("Segoe UI", 9, QFont.Weight.Bold))
-                        sys_item.setForeground(0, QBrush(QColor("#F8FAFC")))
-
+                        sys_item.setFont(0, bold)
                     self._populate_system_nodes_in_tree(sys_item, sys_obj)
                     if sys_obj is active_sys:
                         sys_item.setExpanded(True)
-
                 cat_item.setExpanded(True)
 
         self._updating_ui = False
+        if self.tree_filter.text().strip():
+            self._filter_tree(self.tree_filter.text())
 
     def _highlight_node_in_tree(self, target_obj: object) -> None:
         self._updating_ui = True
@@ -2214,23 +2759,27 @@ class HeliosMainWindow(QMainWindow):
             self._updating_ui = False
 
     def _update_breadcrumb(self) -> None:
-        if self.canvas.view_mode == "galaxy":
-            self.lbl_breadcrumb.setText(
-                f"›  Source Sectors ({len(self.store.systems)} Projects)"
-            )
-            self.btn_rebalance.setVisible(False)
-            return
-
-        self.btn_rebalance.setVisible(True)
         sys_obj = self.canvas.active_system
-        if not sys_obj:
-            self.lbl_breadcrumb.setText("›  No Project Selected")
+        in_galaxy = self.canvas.view_mode == "galaxy"
+        self.btn_bc_galaxy.setProperty("current", "true" if in_galaxy or not sys_obj else "false")
+        theme.repolish(self.btn_bc_galaxy)
+        if in_galaxy or not sys_obj:
+            self.lbl_bc_sep1.setVisible(False)
+            self.btn_bc_project.setVisible(False)
+            self.lbl_bc_sep2.setVisible(False)
+            n = len(self.store.systems)
+            self.lbl_breadcrumb.setText(f"{n} project{'s' if n != 1 else ''}" if in_galaxy else "")
+            theme.set_role(self.lbl_breadcrumb, "muted")
             return
 
-        cat_meta = get_source_meta(sys_obj.source)
         proj_name = sys_obj.project_name or sys_obj.name
-        parts = [cat_meta["title"], proj_name]
+        fm = self.btn_bc_project.fontMetrics()
+        self.btn_bc_project.setText(fm.elidedText(proj_name, Qt.TextElideMode.ElideRight, 190))
+        self.btn_bc_project.setToolTip(f"{proj_name} — show the whole project")
+        self.lbl_bc_sep1.setVisible(True)
+        self.btn_bc_project.setVisible(True)
 
+        parts: List[str] = []
         sel = self.canvas.selected_node
         if isinstance(sel, PlanetNode):
             parts.append(sel.title)
@@ -2239,51 +2788,63 @@ class HeliosMainWindow(QMainWindow):
             if parent_p:
                 parts.append(parent_p.title)
             parts.append(sel.title)
-        else:
-            parts.append("Project Core (Core Plan)")
-
-        self.lbl_breadcrumb.setText("›  " + "  ›  ".join(str(p) for p in parts))
+        elif isinstance(sel, PlanetLink):
+            p_map = {p.id: p.title for p in sys_obj.planets}
+            parts.append(f"{p_map.get(sel.source_planet_id, '?')} → {p_map.get(sel.target_planet_id, '?')}")
+        elif isinstance(sel, CanvasNote):
+            parts.append(sel.title)
+        self.btn_bc_project.setProperty("current", "false" if parts else "true")
+        theme.repolish(self.btn_bc_project)
+        self.lbl_bc_sep2.setVisible(bool(parts))
+        theme.set_role(self.lbl_breadcrumb, "crumb")
+        self.lbl_breadcrumb.setText("  ›  ".join(parts))
 
     def _refresh_sun_anchor_card(self) -> None:
         sys_obj = self.canvas.active_system
+        clear_layout(self.project_chips_layout)
+        clear_layout(self.related_sources_layout)
+        self._refresh_purpose_block(sys_obj)
+        self._refresh_identity_line(sys_obj)
+        self.btn_project_more.setEnabled(sys_obj is not None)
         if not sys_obj:
-            self.sun_title_display.setText("No Project Selected")
-            self.sun_plan_preview.setPlainText("")
+            self.sun_title_display.setText("No project yet")
+            self.lbl_project_counts.setText("Use Add project to analyze a folder.")
             self.related_sources_widget.setVisible(False)
+            self.btn_open_workspace.setEnabled(False)
+            self.btn_copy_prompt.setEnabled(False)
+            if not self._is_ollama_running():
+                self.btn_ollama_single.setEnabled(False)
+            self.btn_edit_toggle.setVisible(False)
             return
-
-        cat_meta = get_source_meta(sys_obj.source)
-        ollama_tag = "  •  OLLAMA VERIFIED" if sys_obj.ollama_enhanced else ""
-        self.sun_badge_label.setText(
-            f"PROJECT CORE & OVERVIEW  •  {cat_meta['title'].upper()}{ollama_tag}"
-        )
+        self.btn_copy_prompt.setEnabled(True)
+        if not self._is_ollama_running():
+            self.btn_ollama_single.setEnabled(True)
         self.sun_title_display.setText(sys_obj.project_name or sys_obj.name)
-        self.sun_plan_preview.setPlainText(sys_obj.core_plan)
+        self.btn_ollama_single.setVisible(self._ai_available() or self._is_ollama_running())
+        sources = list(sys_obj.sources or [sys_obj.source])
+        for src in sources:
+            meta = get_source_meta(src)
+            self.project_chips_layout.addWidget(chip(str(meta.get("short", src)), tooltip=str(meta["title"])))
+        if sys_obj.ollama_enhanced:
+            self.project_chips_layout.addWidget(chip("Ollama", "accent", "The overview was enhanced by a local Ollama model"))
+        self.project_chips_layout.addStretch(1)
+        n_mod, n_link = len(sys_obj.planets), len(sys_obj.links)
+        self.lbl_project_counts.setText(
+            f"{n_mod} module{'s' if n_mod != 1 else ''} · {n_link} link{'s' if n_link != 1 else ''}"
+        )
         self.btn_open_workspace.setEnabled(bool(sys_obj.workspace_path))
-
-        # List counterparts of the same project in other application sources
-        while self.related_sources_layout.count():
-            child = self.related_sources_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
 
         related_list = self.store.find_related_systems(sys_obj)
         if related_list:
-            lbl = QLabel("View in Other Source:")
-            lbl.setStyleSheet("color: #94A3B8; font-size: 11px;")
-            self.related_sources_layout.addWidget(lbl)
+            self.related_sources_layout.addWidget(theme.label("Also in", "muted"))
             for rel_sys in related_list:
                 rel_meta = get_source_meta(rel_sys.source)
-                btn = QPushButton(str(rel_meta["title"]))
-                btn.setObjectName("SubtleBtn")
-                btn.setFixedHeight(22)
+                btn = QPushButton(str(rel_meta["short"]))
+                btn.setObjectName("ChipBtn")
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setToolTip(
-                    f"Switch to the {rel_meta['title']} view of '{rel_sys.project_name}'"
-                )
-                btn.clicked.connect(
-                    lambda checked=False, s=rel_sys: self.canvas.enter_solar_system(s)
-                )
+                btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+                btn.setToolTip(f"Open the {rel_meta['title']} version of '{rel_sys.project_name}'")
+                btn.clicked.connect(lambda checked=False, s=rel_sys: self.canvas.enter_solar_system(s))
                 self.related_sources_layout.addWidget(btn)
             self.related_sources_layout.addStretch(1)
             self.related_sources_widget.setVisible(True)
@@ -2291,48 +2852,417 @@ class HeliosMainWindow(QMainWindow):
             self.related_sources_widget.setVisible(False)
 
     # ------------------------------------------------------------------
+    # Project purpose (what the project is for) in the pinned header
+    # ------------------------------------------------------------------
+    def _refresh_purpose_block(self, sys_obj: Optional[SolarSystem]) -> None:
+        """Header states: the purpose (+ source tag), an AI suggestion waiting for the user
+        (a separate "Suggested" box with Accept / Edit / Dismiss), or one muted
+        "Add what this project is for" line. A suggestion is never shown as the purpose."""
+        if not hasattr(self, "lbl_purpose"):
+            return
+        editing = self.purpose_edit_box.isVisible() and self._purpose_edit_target is not None
+        if editing and self._purpose_edit_target is not sys_obj:
+            self._cancel_purpose_edit(refresh=False)
+            editing = False
+        if editing:
+            return
+        self.purpose_edit_box.setVisible(False)
+        if sys_obj is None:
+            self.purpose_view.setVisible(False)
+            self.purpose_empty.setVisible(False)
+            self.suggestion_box.setVisible(False)
+            return
+        purpose = str(getattr(sys_obj, "purpose", "") or "").strip()
+        suggestion = pending_suggestion(sys_obj)
+        if purpose:
+            self.lbl_purpose.setText(purpose)
+            tag = PURPOSE_SOURCE_TAGS.get(str(getattr(sys_obj, "purpose_source", "") or ""), "")
+            self.lbl_purpose_source.setText(tag)
+            self.lbl_purpose_source.setVisible(bool(tag))
+        else:
+            self.lbl_purpose.setText("")
+        self.purpose_view.setVisible(bool(purpose))
+        self.lbl_suggestion.setText(suggestion)
+        self.suggestion_box.setVisible(bool(suggestion))
+        self.purpose_empty.setVisible(not purpose and not suggestion)
+        # "Suggest with AI" sits on the empty line; with a purpose or a pending suggestion
+        # it is in the "…" menu only.
+        visible, enabled, tip = self._suggest_ai_state(sys_obj)
+        self.btn_suggest_ai.setVisible(visible and not purpose and not suggestion)
+        self.btn_suggest_ai.setEnabled(enabled)
+        self.btn_suggest_ai.setToolTip(tip)
+
+    def _ai_available(self) -> bool:
+        """Ollama is enabled and a model was found (the app's availability state; never
+        probed here). Without it no AI control is shown anywhere."""
+        return not self.store.get_setting("disable_ollama", False) and bool(self._detected_ollama_model)
+
+    def _suggest_ai_state(self, system: Optional[SolarSystem]) -> "tuple[bool, bool, str]":
+        """(visible, enabled, tooltip) of "Suggest with AI" for `system`. Hidden without
+        Ollama and for purposes written by the user or taken from the README; disabled
+        with the reason when the evidence is weak or Ollama is busy."""
+        if system is None or not self._ai_available():
+            return False, False, ""
+        if str(getattr(system, "purpose_source", "") or "") in PROTECTED_PURPOSE_SOURCES:
+            return False, False, ""
+        if not str(getattr(system, "purpose_evidence", "") or "").strip():
+            return True, False, ("Nothing has been collected about this project yet. Re-scan it "
+                                 "(Add project › Analyze a folder, or Sync) so the AI has something to go on.")
+        weak = _weak_purpose_evidence_tip(system)
+        if weak:
+            return True, False, weak
+        if self._is_ollama_running():
+            return True, False, "Ollama is busy with another task. Try again when it has finished."
+        return True, True, (f"Ask the local model ({self._detected_ollama_model}) for a one-sentence "
+                            "suggestion from what was collected about this project. You decide whether to keep it.")
+
+    def _begin_purpose_edit(self, prefill: Optional[str] = None) -> None:
+        """Opens the inline editor with the purpose, or with ``prefill`` ("Edit" on a
+        suggestion: saving makes it the user's purpose, Cancel keeps the suggestion)."""
+        system = self.canvas.active_system
+        if system is None or self._store_busy:
+            return
+        self._purpose_edit_target = system
+        text = prefill if isinstance(prefill, str) else str(getattr(system, "purpose", "") or "")
+        self.edit_purpose.setPlainText(text)
+        self.purpose_view.setVisible(False)
+        self.purpose_empty.setVisible(False)
+        self.suggestion_box.setVisible(False)
+        self.purpose_edit_box.setVisible(True)
+        self.edit_purpose.setFocus(Qt.FocusReason.OtherFocusReason)
+        cursor = self.edit_purpose.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.edit_purpose.setTextCursor(cursor)
+
+    def _cancel_purpose_edit(self, refresh: bool = True) -> None:
+        self._purpose_edit_target = None
+        self.purpose_edit_box.setVisible(False)
+        if refresh:
+            self._refresh_purpose_block(self.canvas.active_system)
+
+    def _save_purpose_edit(self) -> None:
+        target = self._purpose_edit_target
+        if target is None or not any(s is target for s in self.store.systems) or self._store_busy:
+            self._cancel_purpose_edit()
+            return
+        text = self.edit_purpose.toPlainText().strip()
+        probe = copy.copy(target)
+        if not save_edited_purpose(probe, text):
+            self._cancel_purpose_edit()
+            return
+        self.store.push_undo()
+        save_edited_purpose(target, text)
+        self._purpose_edit_target = None
+        self.purpose_edit_box.setVisible(False)
+        self._save_store_quietly()
+        self._after_purpose_changed([target.id])
+        self.status_label.setText(
+            "Description saved. Scans and Ollama will never overwrite it · Ctrl+Z to undo."
+            if text else "Description cleared · Ctrl+Z to undo."
+        )
+
+    def _accept_purpose_suggestion(self) -> bool:
+        system = self.canvas.active_system
+        if system is None or self._store_busy or not pending_suggestion(system):
+            return False
+        self.store.push_undo()
+        accept_purpose_suggestion(system)
+        self._save_store_quietly()
+        self._after_purpose_changed([system.id])
+        self.status_label.setText("Suggestion accepted as the project's purpose · Ctrl+Z to undo.")
+        return True
+
+    def _edit_purpose_suggestion(self) -> None:
+        system = self.canvas.active_system
+        if system is None:
+            return
+        self._begin_purpose_edit(prefill=pending_suggestion(system))
+
+    def _dismiss_purpose_suggestion(self) -> bool:
+        system = self.canvas.active_system
+        if system is None or self._store_busy or not pending_suggestion(system):
+            return False
+        self.store.push_undo()
+        dismiss_purpose_suggestion(system)
+        self._save_store_quietly()
+        self._after_purpose_changed([system.id])
+        self.status_label.setText(
+            "Suggestion dismissed. It is not suggested again unless the project changes · Ctrl+Z to undo."
+        )
+        return True
+
+    def _save_store_quietly(self) -> None:
+        self._updating_ui = True
+        try:
+            self.store.save()
+        except Exception as exc:
+            self.status_label.setText(f"Saving failed: {exc}")
+        finally:
+            self._updating_ui = False
+
+    def _after_purpose_changed(self, system_ids: List[str]) -> None:
+        """Refreshes every view that shows a project's purpose (header, body, tree, cards, sun)."""
+        ids = set(system_ids)
+        self._refresh_purpose_block(self.canvas.active_system)
+        self._refresh_project_tooltips()
+        if hasattr(self.canvas, "refresh_project_texts"):
+            self.canvas.refresh_project_texts(ids)
+        active = self.canvas.active_system
+        if (active is not None and active.id in ids and self._selected_type == "sun"
+                and self._selected_node is active):
+            self._load_node_into_inspector(active, "sun")
+
+    def _project_menu_actions(self, menu: QMenu, system: SolarSystem) -> None:
+        """Purpose entries of the header's "…" menu (AI entries only when Ollama is available)."""
+        act_edit = menu.addAction("Edit purpose")
+        act_edit.triggered.connect(lambda: self._begin_purpose_edit())
+        visible, enabled, tip = self._suggest_ai_state(system)
+        if visible:
+            act_ask = menu.addAction("Suggest with AI")
+            act_ask.setEnabled(enabled)
+            act_ask.setToolTip(tip)
+            act_ask.triggered.connect(lambda: self._suggest_purpose_with_ai(system))
+        act_ev = menu.addAction("Show what this is based on")
+        act_ev.triggered.connect(lambda: self._show_purpose_evidence(system))
+
+    def _show_project_more_menu(self) -> None:
+        system = self.canvas.active_system
+        if system is None:
+            return
+        menu = QMenu(self)
+        self._project_menu_actions(menu, system)
+        menu.addSeparator()
+        act_rm = menu.addAction("Remove project…")
+        act_rm.triggered.connect(lambda: self._remove_project(system))
+        menu.setToolTipsVisible(True)
+        menu.exec(self.btn_project_more.mapToGlobal(QPoint(0, self.btn_project_more.height())))
+
+    def _show_purpose_evidence(self, system: Optional[SolarSystem]) -> Optional[QDialog]:
+        if system is None:
+            return None
+        if self._evidence_viewer is not None:
+            self._evidence_viewer.close()
+            self._evidence_viewer.deleteLater()
+        viewer = EvidenceViewer(system.project_name or system.name,
+                                str(getattr(system, "purpose_evidence", "") or ""), self)
+        self._evidence_viewer = viewer
+        viewer.show()
+        return viewer
+
+    def _suggest_purpose_with_ai(self, system: Optional[SolarSystem]) -> bool:
+        """"Suggest with AI": asks the local model for a purpose suggestion for one project
+        (a manual request: a dismissal is ignored). The answer is only a suggestion."""
+        if system is None or not any(s is system for s in self.store.systems):
+            return False
+        visible, enabled, tip = self._suggest_ai_state(system)
+        if not visible or not enabled:
+            if tip:
+                self.status_label.setText(tip)
+            return False
+        if self._store_busy:
+            self.status_label.setText("A scan is running. Try again once it has finished.")
+            return False
+        return self._start_ollama_worker(
+            [system], str(self._detected_ollama_model), force=False, summarize_project=False,
+            write_purpose=True, purpose_only=True, purpose_manual=True,
+        )
+
+    # --- automatic purpose suggestions after scans -----------------------------
+    def _eligible_purpose_systems(self) -> List[SolarSystem]:
+        """Projects an automatic run asks about (`purpose_suggestion.needs_auto_suggestion`)."""
+        return [s for s in self.store.systems if needs_auto_suggestion(s)]
+
+    def _auto_purpose_allowed(self) -> bool:
+        return self._ai_available() and bool(self.store.get_setting(AUTO_PURPOSE_SETTING_KEY, True))
+
+    def _maybe_auto_suggest_purposes(self, then_modules_id: Optional[str] = None) -> None:
+        """After a successful scan: ask Ollama for purpose suggestions (one request per project
+        that `needs_auto_suggestion`). The answers are suggestions, never purposes.
+
+        Needs Ollama enabled, a known model, the "suggest automatically" setting and a server
+        that answers (checked off the UI thread). Queued while a scan, another Ollama run or
+        a server check is active. ``then_modules_id``: describe that project's modules after.
+        """
+        if not self._auto_purpose_allowed():
+            self._continue_with_module_descriptions(then_modules_id)
+            return
+        if self._store_busy or self._is_ollama_running() or self._ollama_server_check_worker is not None:
+            self._auto_purpose_queued = True
+            if then_modules_id:
+                self._auto_purpose_then_modules = then_modules_id
+            return
+        if not self._eligible_purpose_systems():
+            self._continue_with_module_descriptions(then_modules_id)
+            return
+        self._auto_purpose_queued = False
+        checker = OllamaServerCheckWorker(parent=self)
+        checker.checked.connect(
+            lambda running, sid=then_modules_id: self._on_auto_purpose_server_checked(running, sid)
+        )
+        self._ollama_server_check_worker = checker
+        checker.start()
+
+    def _on_auto_purpose_server_checked(self, running: bool, then_modules_id: Optional[str]) -> None:
+        checker = self._ollama_server_check_worker
+        self._ollama_server_check_worker = None
+        if checker is not None:
+            checker.wait(2000)
+            checker.deleteLater()
+        if not running:
+            self._schedule_queued_auto_purpose()
+            return
+        if self._store_busy or self._is_ollama_running():
+            self._auto_purpose_queued = True
+            if then_modules_id:
+                self._auto_purpose_then_modules = then_modules_id
+            return
+        if not self._auto_purpose_allowed():
+            return
+        targets = self._eligible_purpose_systems()
+        started = bool(targets) and self._start_ollama_worker(
+            targets, str(self._detected_ollama_model), force=False, summarize_project=False,
+            write_purpose=True, purpose_only=True, purpose_then_modules=then_modules_id,
+        )
+        if not started:
+            self._continue_with_module_descriptions(then_modules_id)
+
+    def _continue_with_module_descriptions(self, system_id: Optional[str]) -> None:
+        if not system_id:
+            return
+        system = next((s for s in self.store.systems if s.id == system_id), None)
+        if system is not None:
+            self._maybe_auto_describe_modules(system)
+
+    def _schedule_queued_auto_purpose(self) -> None:
+        if getattr(self, "_auto_purpose_queued", False):
+            QTimer.singleShot(0, self._run_queued_auto_purpose)
+
+    def _run_queued_auto_purpose(self) -> None:
+        if not self._auto_purpose_queued:
+            return
+        if self._store_busy or self._is_ollama_running() or self._ollama_server_check_worker is not None:
+            return  # stays queued; retried when that work ends
+        then_id = self._auto_purpose_then_modules
+        self._auto_purpose_queued = False
+        self._auto_purpose_then_modules = None
+        self._maybe_auto_suggest_purposes(then_id)
+
+    def _purpose_status_text(self) -> str:
+        run = self._purpose_run or {}
+        total = int(run.get("total", 0) or 0)
+        if total == 1 and run.get("names"):
+            return f"Ollama is suggesting a description for '{run['names'][0]}'…"
+        current = min(total, max(int(run.get("done", 0)), int(run.get("current", 0))))
+        return f"Ollama is suggesting project descriptions ({current}/{total})…"
+
+    # ------------------------------------------------------------------
+    # Removing projects and ignored folders
+    # ------------------------------------------------------------------
+    def _remove_project(self, system: Optional[SolarSystem]) -> bool:
+        if system is None or self._store_busy or not any(s is system for s in self.store.systems):
+            return False
+        choice = RemoveProjectDialog.ask(system, self)
+        if choice not in (RemoveProjectDialog.REMOVE, RemoveProjectDialog.IGNORE):
+            return False
+        ignore = choice == RemoveProjectDialog.IGNORE and bool((system.workspace_path or "").strip())
+        self._do_remove_project(system, ignore)
+        return True
+
+    def _do_remove_project(self, system: SolarSystem, ignore: bool) -> None:
+        name = system.project_name or system.name
+        self.store.push_undo()
+        depth = len(getattr(self.store, "_undo_stack", []))
+        self.store.systems = [s for s in self.store.systems if s is not system]
+        ignored = ""
+        if ignore and add_ignored_folder(self.store, system.workspace_path):
+            ignored = normalize_folder(system.workspace_path)
+            self._ignore_undo.append((depth, ignored))
+        self._save_store_quietly()
+        if self._purpose_edit_target is system:
+            self._cancel_purpose_edit(refresh=False)
+        remaining = list(self.store.systems)
+        self.canvas.active_system = remaining[0] if remaining else None
+        self.canvas.selected_node = None
+        self._selected_node = None
+        self._updating_ui = True
+        try:
+            self.canvas.switch_to_galaxy_view()
+            self._populate_tree()
+            self._refresh_sun_anchor_card()
+            self._update_breadcrumb()
+        finally:
+            self._updating_ui = False
+        if self.canvas.active_system is not None:
+            self._load_node_into_inspector(self.canvas.active_system, "sun")
+        else:
+            self._clear_inspector()
+        msg = f"Removed '{name}'."
+        if ignored:
+            msg += " Its folder will not be imported again (Settings › Ignored folders)."
+        self.status_label.setText(msg + " Ctrl+Z to undo.")
+
+    def _clear_inspector(self) -> None:
+        """Empty inspector (no project left)."""
+        self._updating_ui = True
+        try:
+            self._selected_node = None
+            self._selected_type = "sun"
+            clear_layout(self.sel_chips_layout)
+            clear_layout(self.sections_layout)
+            self.sel_chips_widget.setVisible(False)
+            self.sel_title.setVisible(False)
+            self.sel_subtitle.setVisible(False)
+            for btn in (self.btn_open_file, self.btn_link_planet, self.btn_edit_toggle, self.btn_quick_delete):
+                btn.setVisible(False)
+            self.edit_section.setVisible(False)
+            self.ai_summary_box.setVisible(False)
+            self.sections_layout.addWidget(theme.label(
+                "There are no projects yet. Use Add project to analyze a folder, or Sync to read your AI tools.",
+                "muted", wrap=True))
+        finally:
+            self._updating_ui = False
+
+    def _confirm_analyze_ignored(self, folder: Path) -> bool:
+        """Themed question: the chosen folder is on the ignore list. True = stop ignoring and analyze."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("This folder is ignored")
+        box.setText(f"'{folder.name}' is on your list of folders Helios never imports.")
+        box.setInformativeText(f"{folder}\n\nStop ignoring it and analyze it now?")
+        btn_go = box.addButton("Stop ignoring and analyze", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_go)
+        box.exec()
+        return box.clickedButton() is btn_go
+
+    # ------------------------------------------------------------------
     # Interaction & Signal Handlers
     # ------------------------------------------------------------------
     def _on_tree_context_menu(self, pos: QPoint) -> None:
         item = self.hierarchy_tree.itemAt(pos)
         menu = QMenu(self)
-        menu.setStyleSheet(
-            """
-            QMenu {
-                background-color: #0F172A;
-                color: #F8FAFC;
-                border: 1px solid #334155;
-                padding: 4px;
-                border-radius: 6px;
-            }
-            QMenu::item {
-                padding: 6px 14px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #2563EB;
-                color: #FFFFFF;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #1E293B;
-                margin: 4px 0;
-            }
-            """
-        )
 
         if not item:
-            act_new_proj = menu.addAction("+ Design New Project...")
+            act_analyze = menu.addAction("Analyze a folder…")
+            act_analyze.triggered.connect(self._analyze_codebase_folder)
+            act_new_proj = menu.addAction("Design a new project…")
             act_new_proj.triggered.connect(self._create_new_system)
             menu.addSeparator()
-            act_scan_helios = menu.addAction("Scan Helios 'projects/' Directory")
+            act_scan_helios = menu.addAction("Scan the 'projects/' folder")
             act_scan_helios.triggered.connect(self._scan_helios_projects_directly)
-            act_open_projects = menu.addAction("Open 'projects/' Directory in Explorer")
+            act_open_projects = menu.addAction("Open the 'projects/' folder")
             act_open_projects.triggered.connect(self._open_helios_projects_folder)
             menu.addSeparator()
-            act_sync_agents = menu.addAction("Sync AI Agent Histories...")
+            act_expand = menu.addAction("Expand all")
+            act_expand.triggered.connect(self.hierarchy_tree.expandAll)
+            act_collapse = menu.addAction("Collapse all")
+            act_collapse.triggered.connect(self.hierarchy_tree.collapseAll)
+            act_refresh = menu.addAction("Refresh list")
+            act_refresh.triggered.connect(self._populate_tree)
+            menu.addSeparator()
+            act_sync_agents = menu.addAction("Sync AI tools")
             act_sync_agents.triggered.connect(self._sync_agent_histories)
-            act_settings = menu.addAction("Settings...")
+            act_settings = menu.addAction("Settings…")
             act_settings.triggered.connect(self._open_settings_dialog)
             menu.exec(self.hierarchy_tree.viewport().mapToGlobal(pos))
             return
@@ -2345,90 +3275,96 @@ class HeliosMainWindow(QMainWindow):
         if node_type == "project_group":
             proj_name, sys_list = node_obj
             primary_sys = sys_list[0]
-            act_open = menu.addAction(f"Open '{proj_name}' Project")
+            act_open = menu.addAction(f"Open '{proj_name}'")
             act_open.triggered.connect(lambda: self.canvas.enter_solar_system(primary_sys))
             menu.addSeparator()
 
             if len(sys_list) > 1:
                 sources_str = " & ".join(s.source.capitalize() for s in sys_list)
-                act_merge = menu.addAction(f"Merge Project Sources into Single Project ({sources_str})")
+                act_merge = menu.addAction(f"Merge into one project ({sources_str})")
                 act_merge.triggered.connect(lambda: self._merge_specific_systems(sys_list))
                 menu.addSeparator()
 
-            act_add_module = menu.addAction("+ Add Module...")
+            act_add_module = menu.addAction("Add module…")
             act_add_module.triggered.connect(lambda: self._quick_add_module_to_system(primary_sys))
-            act_add_note = menu.addAction("+ Add Architecture Note...")
+            act_add_note = menu.addAction("Add note…")
             act_add_note.triggered.connect(lambda: self._quick_add_note_to_system(primary_sys))
             menu.addSeparator()
-            act_copy_prompt = menu.addAction("Copy as AI Prompt")
+            act_copy_prompt = menu.addAction("Copy as AI prompt")
             act_copy_prompt.triggered.connect(lambda: self._copy_project_as_prompt(primary_sys))
+            menu.addSeparator()
+            for sys_entry in sys_list:
+                label = "Remove project…" if len(sys_list) == 1 else \
+                    f"Remove the {get_source_meta(sys_entry.source)['short']} version…"
+                act_rm = menu.addAction(label)
+                act_rm.triggered.connect(lambda checked=False, t=sys_entry: self._remove_project(t))
 
         elif node_type == "category":
-            act_galaxy = menu.addAction("Show All Projects")
+            act_galaxy = menu.addAction("Show all projects")
             act_galaxy.triggered.connect(lambda: self.canvas.switch_to_galaxy_view())
             menu.addSeparator()
-            act_new_proj = menu.addAction("+ Design New Project...")
+            act_new_proj = menu.addAction("Design a new project…")
             act_new_proj.triggered.connect(self._create_new_system)
 
         elif node_type == "sun" and isinstance(node_obj, SolarSystem):
-            act_open = menu.addAction("Open Project on Canvas")
+            act_open = menu.addAction("Open project")
             act_open.triggered.connect(lambda: self.canvas.enter_solar_system(node_obj))
             menu.addSeparator()
             related = self.store.find_related_systems(node_obj)
             if related:
-                act_merge_rel = menu.addAction(f"Merge with Counterparts ({len(related) + 1} Projects)")
+                act_merge_rel = menu.addAction(f"Merge with its other sources ({len(related) + 1} projects)")
                 act_merge_rel.triggered.connect(lambda: self._merge_specific_systems([node_obj] + related))
                 menu.addSeparator()
-            act_add_module = menu.addAction("+ Add Module...")
+            act_add_module = menu.addAction("Add module…")
             act_add_module.triggered.connect(lambda: self._quick_add_module_to_system(node_obj))
-            act_add_note = menu.addAction("+ Add Architecture Note...")
+            act_add_note = menu.addAction("Add note…")
             act_add_note.triggered.connect(lambda: self._quick_add_note_to_system(node_obj))
             menu.addSeparator()
-            act_copy_prompt = menu.addAction("Copy as AI Prompt")
+            act_copy_prompt = menu.addAction("Copy as AI prompt")
             act_copy_prompt.triggered.connect(lambda: self._copy_project_as_prompt(node_obj))
             if node_obj.workspace_path:
-                act_open_dir = menu.addAction("Open Folder")
+                act_open_dir = menu.addAction("Open folder")
                 act_open_dir.triggered.connect(lambda: self._open_node_path(node_obj))
-            act_rebalance = menu.addAction("Auto-Align Layout")
+            act_rebalance = menu.addAction("Auto-align layout")
             act_rebalance.triggered.connect(lambda: (self.canvas.enter_solar_system(node_obj), self._rebalance_active_system_layout()))
             menu.addSeparator()
-            act_del = menu.addAction("Delete Project...")
-            act_del.triggered.connect(lambda: (self.canvas.enter_solar_system(node_obj), self._load_node_into_inspector(node_obj, "sun"), self._delete_current_node()))
+            act_del = menu.addAction("Remove project…")
+            act_del.triggered.connect(lambda: self._remove_project(node_obj))
 
         elif node_type == "planet" and isinstance(node_obj, PlanetNode):
-            act_sel = menu.addAction("Focus Module")
+            act_sel = menu.addAction("Show module")
             act_sel.triggered.connect(lambda: self.canvas.select_object(node_obj, "planet"))
             menu.addSeparator()
-            act_add_sat = menu.addAction("+ Add Sub-Component...")
+            act_add_sat = menu.addAction("Add component…")
             act_add_sat.triggered.connect(lambda: self._quick_add_sat_to_planet(node_obj))
-            act_link = menu.addAction("Add Data Flow / Link...")
+            act_link = menu.addAction("Link to another module…")
             act_link.triggered.connect(lambda: (self.canvas.select_object(node_obj, "planet"), self._prompt_add_link_from_selected()))
             menu.addSeparator()
-            act_del = menu.addAction("Delete Module...")
+            act_del = menu.addAction("Delete module…")
             act_del.triggered.connect(lambda: (self.canvas.select_object(node_obj, "planet"), self._delete_current_node()))
 
         elif node_type == "satellite" and isinstance(node_obj, SatelliteNode):
-            act_sel = menu.addAction("Select Sub-Component")
+            act_sel = menu.addAction("Show component")
             act_sel.triggered.connect(lambda: self.canvas.select_object(node_obj, "satellite"))
             if node_obj.file_path:
-                act_open_f = menu.addAction("Open Source File")
+                act_open_f = menu.addAction("Open file")
                 act_open_f.triggered.connect(lambda: self._open_node_path(node_obj))
             menu.addSeparator()
-            act_del = menu.addAction("Delete Sub-Component...")
+            act_del = menu.addAction("Delete component…")
             act_del.triggered.connect(lambda: (self.canvas.select_object(node_obj, "satellite"), self._delete_current_node()))
 
         elif node_type == "link" and isinstance(node_obj, PlanetLink):
-            act_sel = menu.addAction("Select & Edit Data Flow")
+            act_sel = menu.addAction("Show link")
             act_sel.triggered.connect(lambda: self.canvas.select_object(node_obj, "link"))
             menu.addSeparator()
-            act_del = menu.addAction("Delete Data Flow...")
+            act_del = menu.addAction("Delete link…")
             act_del.triggered.connect(lambda: (self.canvas.select_object(node_obj, "link"), self._delete_current_node()))
 
         elif node_type == "note" and isinstance(node_obj, CanvasNote):
-            act_sel = menu.addAction("Select & Edit Note")
+            act_sel = menu.addAction("Show note")
             act_sel.triggered.connect(lambda: self.canvas.select_object(node_obj, "note"))
             menu.addSeparator()
-            act_del = menu.addAction("Delete Note...")
+            act_del = menu.addAction("Delete note…")
             act_del.triggered.connect(lambda: (self.canvas.select_object(node_obj, "note"), self._delete_current_node()))
 
         menu.exec(self.hierarchy_tree.viewport().mapToGlobal(pos))
@@ -2436,7 +3372,7 @@ class HeliosMainWindow(QMainWindow):
     def _quick_add_module_to_system(self, sys_obj: SolarSystem) -> None:
         self.canvas.enter_solar_system(sys_obj)
         title, ok = QInputDialog.getText(
-            self, "Add New Module", "Module Title (e.g., Auth API, Database Service):"
+            self, "Add module", "Module name (e.g. Auth API, Database service):"
         )
         if not ok or not title.strip():
             return
@@ -2444,7 +3380,7 @@ class HeliosMainWindow(QMainWindow):
         layer_keys = list(LAYER_DEFINITIONS.keys())
         layer_titles = [LAYER_DEFINITIONS[k][0] for k in layer_keys]
         chosen_l_title, ok2 = QInputDialog.getItem(
-            self, "Module Layer", "Architectural Layer:", layer_titles, 0, False
+            self, "Module layer", "Layer:", layer_titles, 0, False
         )
         chosen_layer = layer_keys[layer_titles.index(chosen_l_title)] if ok2 else "core"
         planet = sys_obj.add_planet(
@@ -2460,14 +3396,14 @@ class HeliosMainWindow(QMainWindow):
 
     def _quick_add_sat_to_planet(self, planet: PlanetNode) -> None:
         title, ok = QInputDialog.getText(
-            self, "New Sub-Component", f"Component Title for '{planet.title}' (e.g., TokenValidator):"
+            self, "Add component", f"Component name in '{planet.title}' (e.g. TokenValidator):"
         )
         if not ok or not title.strip():
             return
         self.store.push_undo()
         sat = planet.add_satellite(
             title=title.strip(),
-            content="Describe what this sub-component does and how it works.",
+            content="Describe what this component does and how it works.",
             visual_tag="code",
         )
         sat.is_user_modified = True
@@ -2479,7 +3415,7 @@ class HeliosMainWindow(QMainWindow):
     def _quick_add_note_to_system(self, sys_obj: SolarSystem) -> None:
         self.canvas.enter_solar_system(sys_obj)
         title, ok = QInputDialog.getText(
-            self, "New Architecture Note", "Note Title (e.g., Data Flow Rule, TODO):"
+            self, "Add note", "Note title (e.g. Rule, To-do):"
         )
         if not ok or not title.strip():
             return
@@ -2572,10 +3508,10 @@ class HeliosMainWindow(QMainWindow):
         sources_str = " & ".join(s.source.capitalize() for s in sys_list)
         reply = QMessageBox.question(
             self,
-            "Merge Projects",
-            f"{len(sys_list)} different sources ({sources_str}) belonging to '{proj_name}' will be merged into a single project.\n\n"
-            "All modules, architectural plans, data flows, and notes will be preserved and combined.\n\n"
-            "Do you confirm the merge?",
+            "Merge projects",
+            f"The {len(sys_list)} sources of '{proj_name}' ({sources_str}) will be merged into one project.\n\n"
+            "All modules, overviews, links and notes are kept.\n\n"
+            "Merge them?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -2596,11 +3532,11 @@ class HeliosMainWindow(QMainWindow):
         self._update_breadcrumb()
         self._updating_ui = False
 
-        self.status_label.setText(f"Sources of project '{proj_name}' merged successfully.")
+        self.status_label.setText(f"Merged the sources of '{proj_name}'.")
         QMessageBox.information(
             self,
-            "Merge Complete",
-            f"Successfully merged {p_cnt} sources and {m_cnt} module/code components for '{proj_name}'!",
+            "Merge complete",
+            f"Merged {p_cnt} sources and {m_cnt} modules or components of '{proj_name}'.",
         )
 
     def _on_canvas_node_selected(self, node_obj: object, node_type: str) -> None:
@@ -2615,19 +3551,10 @@ class HeliosMainWindow(QMainWindow):
     def _on_view_mode_changed(self, mode: str) -> None:
         self._update_breadcrumb()
         if mode == "galaxy":
-            self.btn_view_mode.setText("Back to Project View")
-            self.status_label.setText(
-                "ALL PROJECTS VIEW  •  Use the mouse wheel to zoom in and inspect cards, or click a card to enter a project."
-            )
+            self.status_label.setText("All projects · click a card to open it · scroll to zoom")
         else:
-            self.btn_view_mode.setText("All Projects")
-            proj_name = (
-                (self.canvas.active_system.project_name or self.canvas.active_system.name)
-                if self.canvas.active_system
-                else ""
-            )
             self.status_label.setText(
-                f"ACTIVE PROJECT: {proj_name}  •  Left Click: Select  •  Drag: Move Node  •  Right Click: Menu  •  ESC: All Projects"
+                "Click a module to see its details · drag to move · right-click for more · Esc for all projects"
             )
             self._refresh_sun_anchor_card()
 
@@ -2652,16 +3579,18 @@ class HeliosMainWindow(QMainWindow):
         elif action_name == "edit_link_label" and isinstance(target_obj, PlanetLink):
             new_lbl, ok = QInputDialog.getText(
                 self,
-                "Edit Data Flow Label",
-                "Data flow / relationship description between modules:",
+                "Rename link",
+                "What does this link mean? (e.g. imports, calls, sends data to)",
                 text=target_obj.label,
             )
             if ok and new_lbl.strip():
+                self.store.push_undo()
                 target_obj.label = new_lbl.strip()
+                target_obj.is_user_modified = True  # edited by the user
                 self.store.save()
                 self.canvas.rebuild_scene()
                 self.canvas.select_object(target_obj, "link")
-                self.status_label.setText(f"Data flow label updated: '{target_obj.label}'")
+                self.status_label.setText(f"Link renamed to '{target_obj.label}'.")
         elif action_name == "clear_links" and isinstance(target_obj, PlanetNode):
             if self.canvas.active_system:
                 self.canvas.active_system.links = [
@@ -2692,8 +3621,16 @@ class HeliosMainWindow(QMainWindow):
             elif isinstance(target_obj, SolarSystem):
                 self._selected_type = "sun"
             self._delete_current_node()
+        elif action_name == "remove_project" and isinstance(target_obj, SolarSystem):
+            self._remove_project(target_obj)
+        elif action_name == "edit_purpose" and isinstance(target_obj, SolarSystem):
+            if self.canvas.active_system is not target_obj:
+                self.canvas.enter_solar_system(target_obj)
+            self._begin_purpose_edit()
         elif action_name == "create_new_project":
             self._create_new_system()
+        elif action_name == "analyze_folder":
+            self._analyze_codebase_folder()
         elif action_name == "scan_helios_projects":
             self._scan_helios_projects_directly()
         elif action_name == "merge_duplicates":
@@ -2716,6 +3653,12 @@ class HeliosMainWindow(QMainWindow):
         def filter_item(item: QTreeWidgetItem) -> bool:
             item_text = item.text(0).lower()
             matches = (q in item_text) if q else True
+            if q and not matches:
+                data = item.data(0, Qt.ItemDataRole.UserRole)
+                if data and data[0] == "sun" and isinstance(data[1], SolarSystem):
+                    matches = q in _project_search_text(data[1])
+                elif data and data[0] == "project_group":
+                    matches = any(q in _project_search_text(x) for x in data[1][1])
             child_matches = False
             for i in range(item.childCount()):
                 if filter_item(item.child(i)):
@@ -2739,7 +3682,7 @@ class HeliosMainWindow(QMainWindow):
 
     def _on_tour_step_changed(self, step_idx: int, total: int, title: str) -> None:
         self.tour_card.setVisible(True)
-        self.tour_status_label.setText(f"Architecture Tour ({step_idx}/{total}): {title}")
+        self.tour_status_label.setText(f"Tour {step_idx}/{total} · {title}")
 
     def _stop_tour(self) -> None:
         self.tour_card.setVisible(False)
@@ -2758,12 +3701,49 @@ class HeliosMainWindow(QMainWindow):
             return
         self._run_ollama_for_systems(list(self.store.systems))
 
+    def _ollama_button_label(self) -> str:
+        return "Enhance with Ollama"
+
+    def _update_ollama_button_tooltip(self) -> None:
+        if not hasattr(self, "btn_ollama_single"):
+            return
+        model = self._detected_ollama_model
+        base = "Let a local Ollama model describe this project and its modules (click again to stop)."
+        self.btn_ollama_single.setToolTip(f"{base}\nModel: {model}" if model else base)
+
+    def _update_busy_indicator(self) -> None:
+        if hasattr(self, "busy_bar"):
+            self.busy_bar.setVisible(bool(self._store_busy or self._is_ollama_running()))
+        if hasattr(self, "btn_status_stop"):
+            self.btn_status_stop.setVisible(self._is_ollama_running())
+
+    def _is_ollama_running(self) -> bool:
+        worker = self._ollama_worker
+        return bool(worker is not None and hasattr(worker, "isRunning") and worker.isRunning())
+
+    def _on_ollama_button_clicked(self) -> None:
+        """Starts Ollama for the active project, or stops the run in progress ("Stop Ollama")."""
+        if self._is_ollama_running():
+            self._stop_ollama()
+            return
+        self._enhance_active_project_with_ollama()
+
+    def _stop_ollama(self) -> None:
+        if not self._is_ollama_running():
+            return
+        self._ollama_worker.requestInterruption()
+        self.btn_ollama_single.setEnabled(False)
+        self._ollama_stop_requested = True
+        self._auto_purpose_queued = False  # a stop also cancels descriptions waiting to start
+        self._auto_purpose_then_modules = None
+        self.status_label.setText("Stopping Ollama... results produced so far are kept.")
+
     def _run_ollama_for_systems(self, systems: List[SolarSystem]) -> None:
         if self.store.get_setting("disable_ollama", False):
             QMessageBox.information(
                 self,
-                "Model-Free Mode Active",
-                "External AI was not invoked because 'Run Without Model' is selected in Settings.\n"
+                "Ollama is turned off",
+                "Ollama is turned off in Settings (\"Don't use Ollama\").\n"
                 "Helios determines project summaries using its own rule-based deterministic engine.",
             )
             return
@@ -2771,59 +3751,388 @@ class HeliosMainWindow(QMainWindow):
         if self._ollama_worker and self._ollama_worker.isRunning():
             QMessageBox.information(
                 self,
-                "Ollama Analysis in Progress",
-                "A model verification task is already running in the background.",
+                "Ollama is already running",
+                "Ollama is already describing a project in the background.",
             )
+            return
+
+        if self._store_busy:
+            self.status_label.setText("A scan is running. Start Ollama once it has finished.")
             return
 
         model = self._detected_ollama_model or OllamaEnhancer.get_preferred_model()
         if not model:
             QMessageBox.warning(
                 self,
-                "Ollama Model Not Found",
+                "No Ollama model found",
                 "No installed model was found on this computer.\n"
-                "You can download a new model by clicking the '⚙ Settings' button at the top.",
+                "You can download one in Settings.",
             )
             return
 
-        if hasattr(self, "btn_ollama_single"):
-            self.btn_ollama_single.setEnabled(False)
-        if hasattr(self, "btn_ollama_all"):
-            self.btn_ollama_all.setEnabled(False)
+        force = False
+        if any(str(getattr(p, "ai_summary", "") or "").strip() for s in systems for p in s.planets):
+            answer = QMessageBox.question(
+                self,
+                "Write the AI descriptions again?",
+                "Some modules already have an AI description.\n\n"
+                "Yes: regenerate the descriptions of all modules.\n"
+                "No: only describe modules that do not have one yet.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            force = answer == QMessageBox.StandardButton.Yes
+
         self.status_label.setText(f"Preparing Ollama ({model}) service...")
+        # A full run also fills missing project purposes (never a user-written one).
+        self._start_ollama_worker(systems, model, force=force, summarize_project=True, write_purpose=True)
 
-        self._ollama_worker = OllamaEnhanceWorker(systems, model_name=model, parent=self)
-        self._ollama_worker.progressText.connect(self._on_ollama_progress)
-        self._ollama_worker.finishedEnhance.connect(self._on_ollama_finished)
-        self._ollama_worker.start()
+    @staticmethod
+    def _ollama_worker_params() -> "tuple[set, bool]":
+        """Constructor parameters of the current OllamaEnhanceWorker (names, accepts **kwargs)."""
+        try:
+            sig = inspect.signature(OllamaEnhanceWorker)
+        except (TypeError, ValueError):
+            return set(), False
+        names = {n for n, prm in sig.parameters.items()
+                 if prm.kind not in (prm.VAR_POSITIONAL, prm.VAR_KEYWORD)}
+        var_kw = any(prm.kind == prm.VAR_KEYWORD for prm in sig.parameters.values())
+        return names, var_kw
 
-    def _on_ollama_progress(self, msg: str) -> None:
-        self.status_label.setText(msg)
-        self.lbl_ollama_status.setText(msg)
+    def _start_ollama_worker(
+        self,
+        systems: List[SolarSystem],
+        model: str,
+        force: bool = False,
+        summarize_project: bool = True,
+        write_purpose: Optional[bool] = None,
+        purpose_only: bool = False,
+        purpose_then_modules: Optional[str] = None,
+        purpose_manual: bool = False,
+    ) -> bool:
+        """Creates and starts the Ollama worker (snapshots are taken here, on the UI thread).
 
-    def _on_ollama_finished(self, ok: bool, msg: str) -> None:
+        ``write_purpose`` / ``purpose_only`` / ``purpose_manual`` are passed only if the
+        worker accepts them; a purpose-only run is not started with a worker that cannot do
+        it. Purpose answers are only ever stored as suggestions. Returns True if a worker
+        was started.
+        """
+        names, var_kw = self._ollama_worker_params()
+        extra: Dict[str, object] = {}
+        if write_purpose is not None and ("write_purpose" in names or var_kw):
+            extra["write_purpose"] = bool(write_purpose)
+        if purpose_only:
+            if "purpose_only" not in names and not var_kw:
+                self.status_label.setText(
+                    "This version of the Ollama helper cannot suggest project descriptions yet."
+                )
+                return False
+            extra["purpose_only"] = True
+        if purpose_manual and ("purpose_manual" in names or var_kw):
+            extra["purpose_manual"] = True
+
         if hasattr(self, "btn_ollama_single"):
+            # While running, the Ollama button becomes "Stop Ollama".
+            self.btn_ollama_single.setText("Stop Ollama")
             self.btn_ollama_single.setEnabled(True)
         if hasattr(self, "btn_ollama_all"):
-            self.btn_ollama_all.setEnabled(True)
-        self.lbl_ollama_status.setText(self._get_model_status_text())
-        self.status_label.setText(msg)
+            self.btn_ollama_all.setEnabled(False)
 
-        if ok:
+        # The worker snapshots the systems here, on the UI thread, and only emits new
+        # core plans / module texts / purpose suggestions; they are applied on the UI thread
+        # (_on_ollama_system_enhanced / _on_ollama_module_described / _on_ollama_purpose_suggested).
+        # A suggestion is dropped when the project's evidence changed while Ollama was working.
+        self._purpose_originals = {s.id: current_evidence_key(s) for s in systems}
+        self._purpose_rejections = []
+        self._ollama_stop_requested = False
+        self._ollama_applied = 0
+        self._purpose_run = None
+        self._purpose_run_manual = bool(purpose_manual)
+        if purpose_only:
+            self._purpose_run = {
+                "total": len(systems), "done": 0, "current": 0,
+                "names": [s.project_name or s.name for s in systems],
+                "then_modules": purpose_then_modules,
+                "manual": bool(purpose_manual),
+            }
+        language = str(self.store.get_setting(LANGUAGE_SETTING_KEY, DEFAULT_LANGUAGE) or DEFAULT_LANGUAGE)
+        self._ollama_worker = OllamaEnhanceWorker(
+            systems,
+            model_name=model,
+            parent=self,
+            force=force,
+            language=language,
+            summarize_project=summarize_project,
+            **extra,
+        )
+        self._ollama_worker.progressText.connect(self._on_ollama_progress)
+        self._ollama_worker.systemEnhanced.connect(self._on_ollama_system_enhanced)
+        self._ollama_worker.moduleDescribed.connect(self._on_ollama_module_described)
+        if hasattr(self._ollama_worker, "purposeSuggested"):
+            self._ollama_worker.purposeSuggested.connect(self._on_ollama_purpose_suggested)
+        if hasattr(self._ollama_worker, "purposeRejected"):
+            self._ollama_worker.purposeRejected.connect(self._on_ollama_purpose_rejected)
+        self._ollama_worker.finishedEnhance.connect(self._on_ollama_finished)
+        self._ollama_worker.start()
+        if self._purpose_run is not None:
+            self.status_label.setText(self._purpose_status_text())
+        self._update_busy_indicator()
+        self._refresh_purpose_block(self.canvas.active_system)
+        return True
+
+    def _maybe_auto_describe_modules(self, system: SolarSystem) -> None:
+        """After a single-folder analysis: describe its modules in the background if possible.
+
+        Requires Ollama to be enabled, a known model and a responding server; the server
+        check runs off the UI thread (OllamaServerCheckWorker). Never used after bulk syncs.
+        """
+        if self.store.get_setting("disable_ollama", False) or not self._detected_ollama_model:
+            return
+        if self._is_ollama_running() or self._ollama_server_check_worker is not None:
+            return
+        if not any(p for p in system.planets):
+            return
+        system_id = system.id
+        checker = OllamaServerCheckWorker(parent=self)
+        checker.checked.connect(lambda running, sid=system_id: self._on_auto_describe_server_checked(sid, running))
+        self._ollama_server_check_worker = checker
+        checker.start()
+
+    def _on_auto_describe_server_checked(self, system_id: str, running: bool) -> None:
+        checker = self._ollama_server_check_worker
+        self._ollama_server_check_worker = None
+        if checker is not None:
+            checker.wait(2000)
+            checker.deleteLater()
+        self._schedule_queued_auto_purpose()
+        if not running or self._store_busy or self._is_ollama_running():
+            return
+        if self.store.get_setting("disable_ollama", False) or not self._detected_ollama_model:
+            return
+        system = next((s for s in self.store.systems if s.id == system_id), None)
+        if system is None:
+            return
+        self._start_ollama_worker([system], self._detected_ollama_model, force=False, summarize_project=False,
+                                  write_purpose=False)
+        self.status_label.setText(
+            f"Ollama ({self._detected_ollama_model}) is describing the modules of "
+            f"'{system.project_name or system.name}' in the background. Click 'Stop Ollama' to stop."
+        )
+
+    @Slot(str)
+    def _on_ollama_progress(self, msg: str) -> None:
+        if self._purpose_run is not None:
+            m = re.search(r"\((\d+)\s*/\s*(\d+)\)", str(msg))
+            if m:
+                self._purpose_run["current"] = max(0, int(m.group(1)) - 1)
+            msg = self._purpose_status_text()
+        if not self._store_busy:
+            self.status_label.setText(msg)
+        self._set_ollama_status(msg)
+
+    @Slot(str, str)
+    def _on_ollama_purpose_rejected(self, system_id: str, message: str) -> None:
+        self._purpose_rejections.append((str(system_id), str(message or "")))
+        if self._purpose_run is not None:
+            self._purpose_run["done"] = int(self._purpose_run.get("done", 0)) + 1
+
+    @Slot(str, str)
+    def _on_ollama_purpose_suggested(self, system_id: str, text: str) -> None:
+        self._pending_ollama_purpose_results.append((str(system_id), str(text or "")))
+        if self._purpose_run is not None:
+            self._purpose_run["done"] = int(self._purpose_run.get("done", 0)) + 1
+            if not self._store_busy:
+                self.status_label.setText(self._purpose_status_text())
+        if not self._store_busy:
+            self._apply_pending_ollama_results()
+
+    @Slot(str, str)
+    def _on_ollama_system_enhanced(self, system_id: str, new_plan: str) -> None:
+        worker = self._ollama_worker
+        snap = worker.snapshot_for(system_id) if worker is not None else None
+        original_plan = snap.core_plan if snap is not None else None
+        self._pending_ollama_results.append((system_id, original_plan, new_plan))
+        if not self._store_busy:
+            self._apply_pending_ollama_results()
+
+    @Slot(str, str, str)
+    def _on_ollama_module_described(self, system_id: str, planet_id: str, text: str) -> None:
+        worker = self._ollama_worker
+        ps = None
+        if worker is not None and hasattr(worker, "planet_snapshot_for"):
+            ps = worker.planet_snapshot_for(system_id, planet_id)
+        original_title = ps.title if ps is not None else None
+        self._pending_ollama_module_results.append((system_id, planet_id, original_title, text))
+        if not self._store_busy:
+            self._apply_pending_ollama_results()
+
+    def _apply_pending_ollama_results(self) -> int:
+        """Applies queued Ollama results on the UI thread; returns how many were skipped."""
+        skipped = 0
+        pending, self._pending_ollama_results = self._pending_ollama_results, []
+        for system_id, original_plan, new_plan in pending:
+            target = next((s for s in self.store.systems if s.id == system_id), None)
+            if target is None or (original_plan is not None and target.core_plan != original_plan):
+                # Project deleted or its summary edited/rescanned while Ollama was running.
+                skipped += 1
+                continue
+            target.core_plan = new_plan
+            target.ollama_enhanced = True
+        module_pending, self._pending_ollama_module_results = self._pending_ollama_module_results, []
+        for system_id, planet_id, original_title, text in module_pending:
+            target = next((s for s in self.store.systems if s.id == system_id), None)
+            planet = next((p for p in target.planets if p.id == planet_id), None) if target else None
+            if planet is None or (original_title is not None and planet.title != original_title):
+                # Module removed or renamed while Ollama was running: drop silently.
+                skipped += 1
+                continue
+            # Prose only: the structure (nodes/links) and user-edit flags stay untouched.
+            planet.ai_summary = text
+            self._ollama_applied += 1
+            if self._selected_node is planet:
+                self._refresh_ai_summary_block(planet)
+        purpose_pending, self._pending_ollama_purpose_results = self._pending_ollama_purpose_results, []
+        changed: List[str] = []
+        manual = bool(getattr(self, "_purpose_run_manual", False))
+        for system_id, text in purpose_pending:
+            target = next((s for s in self.store.systems if s.id == system_id), None)
+            if target is None:
+                skipped += 1
+                continue
+            original = self._purpose_originals.get(system_id)
+            if original is not None and current_evidence_key(target) != original:
+                skipped += 1  # re-scanned while Ollama was working: made from old evidence
+                continue
+            # Only ever a suggestion; refused for "user" / "readme" purposes, dismissed
+            # evidence (automatic runs) and answers that fail the quality check.
+            if set_purpose_suggestion(target, text, manual=manual):
+                self._ollama_applied += 1
+                changed.append(system_id)
+            elif manual and (target.purpose_source or "") not in PROTECTED_PURPOSE_SOURCES:
+                quality = check_suggestion_text(target, text)
+                if not quality.ok:
+                    self._purpose_rejections.append(
+                        (system_id, f"No suggestion: {quality.detail} (reason: {quality.reason})."))
+                else:
+                    skipped += 1
+            else:
+                skipped += 1
+        if changed:
+            self._after_purpose_changed(changed)
+        self._ollama_skipped = getattr(self, "_ollama_skipped", 0) + skipped
+        return skipped
+
+    def _flush_pending_ollama_results(self) -> None:
+        if self._store_busy:
+            return
+        if self._pending_ollama_results or self._pending_ollama_module_results or self._pending_ollama_purpose_results:
+            self._apply_pending_ollama_results()
+        if self._pending_ollama_finish is not None:
+            ok, msg = self._pending_ollama_finish
+            self._pending_ollama_finish = None
+            self._on_ollama_finished(ok, msg)
+
+    @Slot(bool, str)
+    def _on_ollama_finished(self, ok: bool, msg: str) -> None:
+        if self._store_busy:
+            # A store worker owns the store; finish (apply + save) once it is done.
+            self._pending_ollama_finish = (ok, msg)
+            return
+        worker = self._ollama_worker
+        if worker is not None and self.sender() is worker:
+            worker.wait(2000)
+        self._apply_pending_ollama_results()
+        skipped = getattr(self, "_ollama_skipped", 0)
+        self._ollama_skipped = 0
+        if skipped:
+            msg = f"{msg} ({skipped} result(s) not applied because the project changed meanwhile.)"
+        if hasattr(self, "btn_ollama_single"):
+            self.btn_ollama_single.setEnabled(True)
+            self.btn_ollama_single.setText(self._ollama_button_label())
+        if hasattr(self, "btn_ollama_all"):
+            self.btn_ollama_all.setEnabled(True)
+        self._refresh_ai_controls()
+        purpose_run, self._purpose_run = self._purpose_run, None
+        rejections, self._purpose_rejections = self._purpose_rejections, []
+        stopped = self._ollama_stop_requested
+        self._ollama_stop_requested = False
+        applied = self._ollama_applied
+        if purpose_run is not None and purpose_run.get("manual"):
+            # One quiet line for a manual "Suggest with AI" request.
+            if applied:
+                msg = "Suggestion ready: accept, edit or dismiss it above the map."
+            elif rejections and not stopped:
+                last = rejections[-1][1]
+                kind = classify_purpose_failure(last)
+                if kind == "unknown":
+                    msg = "No suggestion: the evidence was not enough to tell what this project is for."
+                elif kind == "rejected":
+                    detail = purpose_failure_detail(last) or "the answer did not match the evidence"
+                    msg = f"No suggestion: {detail}."
+        elif purpose_run is not None:
+            # Automatic runs: rejections are silent; only report what was suggested.
+            msg = (f"Ollama suggested {applied} project description{'s' if applied != 1 else ''} "
+                   "(shown as “Suggested” until you accept them)." if applied else "")
+        self.status_label.setText(msg)
+        self._update_busy_indicator()
+        self._ollama_applied = 0
+        self._refresh_purpose_block(self.canvas.active_system)
+        if purpose_run is not None and purpose_run.get("then_modules") and not stopped:
+            # Order after a single-folder analysis: the purpose first, then the modules.
+            QTimer.singleShot(0, lambda sid=purpose_run["then_modules"]: self._continue_with_module_descriptions(sid))
+        else:
+            self._schedule_queued_auto_purpose()
+
+        if ok or applied:
+            # Saved once per run (not per module).
             self._updating_ui = True
-            self.store.save()
-            self._updating_ui = False
+            try:
+                self.store.save()
+            except Exception as exc:
+                self.status_label.setText(f"{msg} Saving failed: {exc}")
+            finally:
+                self._updating_ui = False
             self._refresh_sun_anchor_card()
             self.canvas.rebuild_scene()
             if self._selected_type == "sun" and self.canvas.active_system:
                 self._load_node_into_inspector(self.canvas.active_system, "sun")
+            elif self._selected_type == "planet" and isinstance(self._selected_node, PlanetNode):
+                self._refresh_ai_summary_block(self._selected_node)
+
+    def _refresh_ai_summary_block(self, planet: Optional[object]) -> None:
+        """Shows the read-only AI description block for a planet that has one, else hides it."""
+        text = ""
+        if isinstance(planet, PlanetNode):
+            text = str(getattr(planet, "ai_summary", "") or "").strip()
+        self.lbl_ai_summary.setText(text)
+        self.ai_summary_box.setVisible(bool(text))
+
+    def _clear_selected_ai_summary(self) -> None:
+        planet = self._selected_node
+        if not isinstance(planet, PlanetNode) or not str(planet.ai_summary or "").strip():
+            return
+        if self._store_busy:
+            return
+        self.store.push_undo()
+        planet.ai_summary = ""  # does not touch summary or is_user_modified
+        self._updating_ui = True
+        try:
+            self.store.save()
+        finally:
+            self._updating_ui = False
+        self._refresh_ai_summary_block(planet)
+        self.status_label.setText(f"AI description of '{planet.title}' cleared.")
 
     # ------------------------------------------------------------------
     # Open Folder / File and Copy AI Context (Prompt)
     # ------------------------------------------------------------------
     def _open_node_path(self, node_obj: Optional[object]) -> None:
         target_path_str = ""
-        if isinstance(node_obj, SatelliteNode) and node_obj.file_path:
+        if isinstance(node_obj, (SatelliteNode, PlanetNode)) and getattr(node_obj, "file_path", ""):
             target_path_str = node_obj.file_path
         elif isinstance(node_obj, SolarSystem) and node_obj.workspace_path:
             target_path_str = node_obj.workspace_path
@@ -2833,8 +4142,8 @@ class HeliosMainWindow(QMainWindow):
         if not target_path_str:
             QMessageBox.information(
                 self,
-                "File / Folder Path Not Found",
-                "There is no saved local file/folder path for this project or component.",
+                "No file or folder",
+                "Helios has no saved file or folder location for this item.",
             )
             return
 
@@ -2846,7 +4155,7 @@ class HeliosMainWindow(QMainWindow):
             else:
                 QMessageBox.warning(
                     self,
-                    "Location Not Found",
+                    "Location not found",
                     f"The specified path was not found on disk:\n{target_path_str}",
                 )
                 return
@@ -2860,7 +4169,7 @@ class HeliosMainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", str(target_path)])
             self.status_label.setText(f"Opened: {target_path}")
         except Exception as exc:
-            QMessageBox.warning(self, "Open Error", f"Could not open location:\n{exc}")
+            QMessageBox.warning(self, "Could not open", f"Could not open the location:\n{exc}")
 
     def _copy_project_as_prompt(self, sys_obj: Optional[SolarSystem]) -> None:
         if not sys_obj:
@@ -2868,8 +4177,11 @@ class HeliosMainWindow(QMainWindow):
         cat_meta = get_source_meta(sys_obj.source)
         lines: List[str] = [
             f"# PROJECT ARCHITECTURAL CONTEXT: {sys_obj.project_name or sys_obj.name}",
-            f"Source: {cat_meta['title']}",
         ]
+        purpose = " ".join(str(getattr(sys_obj, "purpose", "") or "").split())
+        if purpose:
+            lines.append(f"Purpose: {purpose}")
+        lines.append(f"Source: {cat_meta['title']}")
         if sys_obj.workspace_path:
             lines.append(f"Workspace Directory: {sys_obj.workspace_path}")
         lines.append("\n## 1. Project Topic, Purpose, and Overall Architecture")
@@ -2881,6 +4193,9 @@ class HeliosMainWindow(QMainWindow):
                 lines.append(f"\n### {idx}. {p.title}")
                 if p.summary:
                     lines.append(p.summary.strip())
+                ai_text = " ".join(str(getattr(p, "ai_summary", "") or "").split())
+                if ai_text:
+                    lines.append(f"AI description (Ollama, may be inaccurate): {ai_text}")
                 for s in p.satellites:
                     s_desc = s.content.strip().replace("\n", " ")
                     if len(s_desc) > 220:
@@ -2916,7 +4231,7 @@ class HeliosMainWindow(QMainWindow):
         self.canvas.active_system.rebalance_layout(force=True)
         self.store.save()
         self.canvas.rebuild_scene()
-        self.status_label.setText("Module and sub-component positions aligned to a balanced radial layout.")
+        self.status_label.setText("Modules and components are back on evenly spaced orbits.")
 
     def _prompt_add_link_from_selected(self) -> None:
         if not isinstance(self._selected_node, PlanetNode) or not self.canvas.active_system:
@@ -2927,15 +4242,15 @@ class HeliosMainWindow(QMainWindow):
         if not candidates:
             QMessageBox.information(
                 self,
-                "No Other Modules",
-                "There must be at least 2 modules in the project to draw a link.",
+                "No other modules",
+                "A link needs at least two modules in the project.",
             )
             return
 
         titles = [p.title for p in candidates]
         chosen_title, ok = QInputDialog.getItem(
             self,
-            "Add Inter-Module Link",
+            "Add link",
             f"Select the target module to connect from '{src_planet.title}':",
             titles,
             0,
@@ -2950,9 +4265,9 @@ class HeliosMainWindow(QMainWindow):
 
         rel_label, ok2 = QInputDialog.getText(
             self,
-            "Link Description",
-            "Relationship / Data Flow Label (e.g., provides data, calls, depends on):",
-            text="data flow",
+            "Link label",
+            "What does this link mean? (e.g. imports, calls, sends data to)",
+            text="uses",
         )
         if not ok2:
             return
@@ -2974,154 +4289,363 @@ class HeliosMainWindow(QMainWindow):
     # Right Panel: Detail Inspector
     # ------------------------------------------------------------------
     def _load_node_into_inspector(self, node_obj: object, node_type: str) -> None:
+        """Shows the selection in the inspector (read view) and fills the hidden edit fields."""
         self._updating_ui = True
-        self._selected_node = node_obj
-        self._selected_type = node_type
-        self.combo_meta.clear()
-        self.lbl_links_info.setVisible(False)
-        self.btn_link_planet.setVisible(False)
+        try:
+            self._selected_node = node_obj
+            self._selected_type = node_type
+            self.combo_meta.clear()
+            self.btn_link_planet.setVisible(False)
+            self.btn_open_file.setVisible(False)
+            self.btn_quick_delete.setVisible(False)
+            self.btn_edit_toggle.setVisible(True)
+            self.btn_edit_toggle.setChecked(False)
+            self.edit_section.setVisible(False)
+            clear_layout(self.sel_chips_layout)
+            clear_layout(self.sections_layout)
+            self.sel_title.setVisible(True)
+            self.sel_subtitle.setVisible(False)
+            self._refresh_ai_summary_block(node_obj if node_type == "planet" else None)
+            system = self.canvas.active_system
+
+            if node_type == "sun" and isinstance(node_obj, SolarSystem):
+                self._render_project(node_obj)
+            elif node_type == "planet" and isinstance(node_obj, PlanetNode):
+                self._render_module(node_obj, system)
+            elif node_type == "satellite" and isinstance(node_obj, SatelliteNode):
+                self._render_component(node_obj, system)
+            elif node_type == "link" and isinstance(node_obj, PlanetLink):
+                self._render_link(node_obj, system)
+            elif node_type == "note" and isinstance(node_obj, CanvasNote):
+                self._render_note(node_obj)
+            self.sel_chips_layout.addStretch(1)
+            self.sel_chips_widget.setVisible(self.sel_chips_layout.count() > 1)
+            self._set_save_primary(False)
+            self.inspector_scroll.verticalScrollBar().setValue(0)
+        finally:
+            self._updating_ui = False
+
+    # --- rendering per selection type ------------------------------------
+    def _add_section(self, title: str, widgets: List[QWidget]) -> None:
+        if not widgets:
+            return
+        self.sections_layout.addWidget(section_label(title))
+        for w in widgets:
+            self.sections_layout.addWidget(w)
+        self.sections_layout.addSpacing(8)
+
+    def _module_rows(self, planets: List[PlanetNode], limit: int = 80) -> List[QWidget]:
+        rows: List[QWidget] = []
+        for p in planets[:limit]:
+            rows.append(RowButton(p.title, planet_caption(p), "●",
+                                  on_click=lambda checked=False, t=p: self._select_and_center(t)))
+        if len(planets) > limit:
+            rows.append(theme.label(f"…and {len(planets) - limit} more", "muted"))
+        return rows
+
+    def _select_and_center(self, planet: PlanetNode) -> None:
+        if self.canvas.view_mode != "system" and self.canvas.active_system:
+            self.canvas.enter_solar_system(self.canvas.active_system)
+        self.canvas.select_object(planet, "planet")
+        self.canvas.center_on_node(planet)
+
+    def _select_component(self, sat: SatelliteNode) -> None:
+        if self.canvas.view_mode != "system" and self.canvas.active_system:
+            self.canvas.enter_solar_system(self.canvas.active_system)
+        self.canvas.select_object(sat, "satellite")
+        parent = self.canvas.active_system.find_parent_planet(sat) if self.canvas.active_system else None
+        if parent is not None:
+            self.canvas.center_on_node(parent)
+
+    def _render_project(self, system: SolarSystem) -> None:
+        self.sel_title.setVisible(False)
         self.btn_open_file.setVisible(False)
+        self.btn_edit_toggle.setText("Edit project")
+        self.lbl_title_field.setText("Project name")
+        self.edit_title.setText(system.project_name or system.name)
+        self.lbl_content_header.setText("Overview")
+        self.edit_content.setPlainText(system.core_plan)
+        self.meta_row_widget.setVisible(False)
+        self.btn_delete_node.setText("Remove project…")
+        self.btn_delete_node.setEnabled(True)
 
-        if node_type == "sun" and isinstance(node_obj, SolarSystem):
-            cat_meta = get_source_meta(node_obj.source)
-            self.inspector_type_badge.setText(
-                f"PROJECT CORE (SUN)  •  {cat_meta['title'].upper()}"
-            )
-            self.lbl_content_header.setText("Project Topic, What It Does, and Core Architectural Plan:")
-            self.edit_title.setText(node_obj.project_name or node_obj.name)
-            self.edit_content.setPlainText(node_obj.core_plan)
-            self.meta_row_widget.setVisible(False)
-            self.btn_delete_node.setText("Delete Project")
-            self.btn_delete_node.setEnabled(len(self.store.systems) > 1)
-            if node_obj.workspace_path:
-                self.btn_open_file.setText("Open Folder")
-                self.btn_open_file.setVisible(True)
+        purpose = str(getattr(system, "purpose", "") or "").strip()
+        # The purpose is shown once, in the pinned header above; it is not repeated here.
+        about = strip_repeated_text(system.core_plan or "", purpose) if purpose else (system.core_plan or "")
+        if about.strip():
+            self._add_section("About", [ExpandableText(about, max_lines=8)])
+        elif not purpose:
+            self._add_section("About", [theme.label("No overview yet. Use Edit project to write one.", "muted", wrap=True)])
+        sources = ", ".join(str(get_source_meta(s).get("title", s)) for s in (system.sources or [system.source]))
+        n_comp = sum(len(p.satellites) for p in system.planets)
+        facts = [("Sources", sources), ("Modules", str(len(system.planets))), ("Components", str(n_comp)),
+                 ("Links", str(len(system.links)))]
+        if system.workspace_path:
+            facts.insert(1, ("Folder", system.workspace_path))
+        if system.updated_at:
+            facts.append(("Updated", str(system.updated_at).replace("T", " ")[:16]))
+        self._add_section("Key facts", [KeyValueGrid(facts)])
+        entries = [p for p in system.planets if bool(getattr(p, "is_entry", False))]
+        if entries:
+            self._add_section("Program starts in", self._module_rows(entries))
+        main = [p for p in system.planets if p.kind not in ("history", "external")]
+        quiet = [p for p in system.planets if p.kind in ("history", "external")]
+        self._add_section(f"Modules ({len(main)})", self._module_rows(main))
+        if quiet:
+            self._add_section("Also in this project", self._module_rows(quiet))
 
-            sat_total = sum(len(p.satellites) for p in node_obj.planets)
-            self.lbl_links_info.setVisible(True)
-            self.lbl_links_info.setText(
-                f"Scope: {len(node_obj.planets)} architectural layers, {sat_total} sub-components, and "
-                f"{len(node_obj.links)} dependency links."
-            )
+    def _render_module(self, planet: PlanetNode, system: Optional[SolarSystem]) -> None:
+        kind = str(getattr(planet, "kind", "") or "")
+        self.sel_chips_layout.addWidget(chip(theme.PLANET_KIND_LABELS.get(kind, "Module")))
+        layer_label = LAYER_DEFINITIONS.get(planet.layer, ("", ""))[0]
+        if layer_label and kind not in ("history", "external"):
+            self.sel_chips_layout.addWidget(chip(layer_label.split("(")[0].strip()))
+        if bool(getattr(planet, "is_entry", False)):
+            self.sel_chips_layout.addWidget(chip("Program starts here", "accent"))
+        self.sel_title.setText(planet.title)
+        sub = planet_caption(planet)
+        if planet.file_path:
+            sub = f"{sub} · {planet.file_path}" if sub else planet.file_path
+        self.sel_subtitle.setText(sub)
+        self.sel_subtitle.setVisible(bool(sub))
+        if planet.file_path:
+            self.btn_open_file.setText("Open folder" if kind == "dir" else "Open file")
+            self.btn_open_file.setVisible(True)
+        self.btn_link_planet.setVisible(True)
+        self.btn_edit_toggle.setText("Edit")
 
-        elif node_type == "planet" and isinstance(node_obj, PlanetNode):
-            layer_label, _ = LAYER_DEFINITIONS.get(
-                node_obj.layer, ("Architectural Module", "#3B82F6")
-            )
-            self.inspector_type_badge.setText(
-                f"ARCHITECTURAL MODULE (PLANET)  •  {layer_label.upper()} ({len(node_obj.satellites)} Sub-Components)"
-            )
-            self.lbl_content_header.setText("What This Module Does, Its Role, and Operating Logic:")
-            self.edit_title.setText(node_obj.title)
-            self.edit_content.setPlainText(node_obj.summary)
-            self.meta_row_widget.setVisible(True)
-            self.btn_link_planet.setVisible(True)
-            self.lbl_meta.setText("Module Color:")
-            for label, hex_code in PLANET_COLOR_PRESETS:
-                self.combo_meta.addItem(label, hex_code)
-            idx = self.combo_meta.findData(node_obj.color)
-            if idx >= 0:
-                self.combo_meta.setCurrentIndex(idx)
-            self.btn_delete_node.setText("Delete Module")
-            self.btn_delete_node.setEnabled(True)
+        self.lbl_title_field.setText("Module name")
+        self.edit_title.setText(planet.title)
+        self.lbl_content_header.setText("Description")
+        self.edit_content.setPlainText(planet.summary)
+        self.meta_row_widget.setVisible(True)
+        self.lbl_meta.setText("Colour")
+        for label, hex_code in PLANET_COLOR_PRESETS:
+            self.combo_meta.addItem(self._dot_icon(hex_code), label, hex_code)
+        idx = self.combo_meta.findData(planet.color)
+        if idx >= 0:
+            self.combo_meta.setCurrentIndex(idx)
+        self.btn_delete_node.setText("Delete module")
+        self.btn_delete_node.setEnabled(True)
 
-            if self.canvas.active_system:
-                sys_obj = self.canvas.active_system
-                p_map = {p.id: p.title for p in sys_obj.planets}
-                outgoing = [
-                    f"{p_map.get(l.target_id, '?')} ({l.label})"
-                    for l in sys_obj.links
-                    if l.source_id == node_obj.id and l.target_id in p_map
-                ]
-                incoming = [
-                    f"{p_map.get(l.source_id, '?')} ({l.label})"
-                    for l in sys_obj.links
-                    if l.target_id == node_obj.id and l.source_id in p_map
-                ]
-                info_parts: List[str] = []
-                if node_obj.satellites:
-                    sat_names = ", ".join(s.title for s in node_obj.satellites[:5])
-                    info_parts.append(f"Sub-Components ({len(node_obj.satellites)}): {sat_names}")
-                if incoming:
-                    info_parts.append("Incoming Links: " + ", ".join(incoming[:3]))
-                if outgoing:
-                    info_parts.append("Outgoing Links: " + ", ".join(outgoing[:3]))
-                if info_parts:
-                    self.lbl_links_info.setVisible(True)
-                    self.lbl_links_info.setText("\n".join(info_parts))
+        if (planet.summary or "").strip():
+            self._add_section("About", [ExpandableText(planet.summary, max_lines=8)])
+        if system is not None:
+            p_map = {p.id: p for p in system.planets}
+            uses = [(p_map[l.target_id], l) for l in system.links if l.source_id == planet.id and l.target_id in p_map]
+            used_by = [(p_map[l.source_id], l) for l in system.links if l.target_id == planet.id and l.source_id in p_map]
+            self._add_section(f"Uses ({len(uses)})", [
+                RowButton(t.title, l.label, "→", on_click=lambda checked=False, x=t: self._select_and_center(x))
+                for t, l in uses
+            ])
+            self._add_section(f"Used by ({len(used_by)})", [
+                RowButton(t.title, l.label, "←", on_click=lambda checked=False, x=t: self._select_and_center(x))
+                for t, l in used_by
+            ])
+        sats = planet.satellites
+        rows: List[QWidget] = []
+        for sat in sats[:120]:
+            sk = str(getattr(sat, "kind", "") or "")
+            sig = str(getattr(sat, "signature", "") or "").strip()
+            rows.append(RowButton(
+                sat.title,
+                sig or theme.SATELLITE_KIND_LABELS.get(sk, ""),
+                theme.SATELLITE_KIND_GLYPHS.get(sk, "·"),
+                on_click=lambda checked=False, x=sat: self._select_component(x),
+                mono_secondary=bool(sig),
+            ))
+        if len(sats) > 120:
+            rows.append(theme.label(f"…and {len(sats) - 120} more", "muted"))
+        self._add_section(f"Contains ({len(sats)})", rows)
 
-        elif node_type == "satellite" and isinstance(node_obj, SatelliteNode):
-            parent_title = ""
-            if self.canvas.active_system:
-                parent_p = self.canvas.active_system.find_parent_planet(node_obj)
-                if parent_p:
-                    parent_title = f"  •  MODULE: {parent_p.title.upper()}"
-            self.inspector_type_badge.setText(f"SUB-COMPONENT (SATELLITE){parent_title}")
-            self.lbl_content_header.setText("What This Component Does, How It Works, and Technical Details:")
-            self.edit_title.setText(node_obj.title)
-            self.edit_content.setPlainText(node_obj.content)
-            self.meta_row_widget.setVisible(True)
-            self.lbl_meta.setText("Component Type:")
-            for label, tag_code in SATELLITE_TAG_PRESETS:
-                self.combo_meta.addItem(label, tag_code)
-            idx = self.combo_meta.findData(node_obj.visual_tag)
-            if idx >= 0:
-                self.combo_meta.setCurrentIndex(idx)
-            self.btn_delete_node.setText("Delete Component")
-            self.btn_delete_node.setEnabled(True)
-
-            if node_obj.file_path:
-                self.btn_open_file.setText("Open File")
-                self.btn_open_file.setVisible(True)
-                self.lbl_links_info.setVisible(True)
-                self.lbl_links_info.setText(f"Source File: {node_obj.file_path}")
-
-        elif node_type == "link" and isinstance(node_obj, PlanetLink):
-            src_name = "?"
-            dst_name = "?"
-            if self.canvas.active_system:
-                p_map = {p.id: p.title for p in self.canvas.active_system.planets}
-                src_name = p_map.get(node_obj.source_planet_id, "?")
-                dst_name = p_map.get(node_obj.target_planet_id, "?")
-            self.inspector_type_badge.setText("DATA FLOW & LINK ARROW")
-            self.lbl_content_header.setText("Flow Description & Technical Contract (Payload, Endpoint, Rules):")
-            self.edit_title.setText(node_obj.label)
-            if node_obj.description:
-                self.edit_content.setPlainText(node_obj.description)
+    def _ref_rows(self, refs: List[str], system: Optional[SolarSystem], glyph: str) -> List[QWidget]:
+        rows: List[QWidget] = []
+        for ref in refs:
+            ref = str(ref)
+            planet, sat = resolve_component_ref(system, ref)
+            p_title, _, s_title = ref.partition("::")
+            if sat is not None:
+                rows.append(RowButton(sat.title, planet.title if planet else "", glyph,
+                                      on_click=lambda checked=False, x=sat: self._select_component(x)))
             else:
-                self.edit_content.setPlainText(
-                    f"FLOW DIRECTION: {src_name} → {dst_name}\n\n"
-                    f"TECHNICAL CONTRACT & PAYLOAD:\n"
-                    f"• Write the transmitted data models, API endpoints, or call details here."
-                )
-            self.meta_row_widget.setVisible(True)
-            self.lbl_meta.setText("Flow Type:")
-            for r_key, (r_label, _) in RELATION_TYPES.items():
-                self.combo_meta.addItem(r_label, r_key)
-            idx = self.combo_meta.findData(node_obj.relation_type)
-            if idx >= 0:
-                self.combo_meta.setCurrentIndex(idx)
-            self.btn_delete_node.setText("Delete Data Flow")
-            self.btn_delete_node.setEnabled(True)
-            self.lbl_links_info.setVisible(True)
-            self.lbl_links_info.setText(f"Direction: {src_name}  →  {dst_name}")
+                rows.append(PlainRow(s_title or ref, f"{p_title} · not on the map" if s_title else "not on the map",
+                                     glyph, tooltip=f"{ref}\nThis component is not part of the map."))
+        return rows
 
-        elif node_type == "note" and isinstance(node_obj, CanvasNote):
-            self.inspector_type_badge.setText("ARCHITECTURAL NOTE & RULE CARD")
-            self.lbl_content_header.setText("Note Content, Data Flow Rules, or Action Items:")
-            self.edit_title.setText(node_obj.title)
-            self.edit_content.setPlainText(node_obj.content)
-            self.meta_row_widget.setVisible(True)
-            self.lbl_meta.setText("Card Color:")
-            for label, hex_code in PLANET_COLOR_PRESETS:
-                self.combo_meta.addItem(label, hex_code)
-            idx = self.combo_meta.findData(node_obj.color)
-            if idx >= 0:
-                self.combo_meta.setCurrentIndex(idx)
-            self.btn_delete_node.setText("Delete Note")
-            self.btn_delete_node.setEnabled(True)
+    def _render_component(self, sat: SatelliteNode, system: Optional[SolarSystem]) -> None:
+        sk = str(getattr(sat, "kind", "") or "")
+        self.sel_chips_layout.addWidget(chip(theme.SATELLITE_KIND_LABELS.get(sk, "Component")))
+        parent = system.find_parent_planet(sat) if system else None
+        if parent is not None:
+            btn = QPushButton(f"in {parent.title}")
+            btn.setObjectName("ChipBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            btn.setToolTip("Show the module this component belongs to")
+            btn.clicked.connect(lambda checked=False, x=parent: self._select_and_center(x))
+            self.sel_chips_layout.addWidget(btn)
+        self.sel_title.setText(sat.title)
+        self.btn_edit_toggle.setText("Edit")
 
-        self._updating_ui = False
+        self.lbl_title_field.setText("Component name")
+        self.edit_title.setText(sat.title)
+        self.lbl_content_header.setText("Description")
+        self.edit_content.setPlainText(sat.content)
+        self.meta_row_widget.setVisible(True)
+        self.lbl_meta.setText("Type")
+        for label, tag_code in SATELLITE_TAG_PRESETS:
+            self.combo_meta.addItem(label, tag_code)
+        idx = self.combo_meta.findData(sat.visual_tag)
+        if idx >= 0:
+            self.combo_meta.setCurrentIndex(idx)
+        self.btn_delete_node.setText("Delete component")
+        self.btn_delete_node.setEnabled(True)
+
+        sig = str(getattr(sat, "signature", "") or "").strip()
+        if sig:
+            lbl = theme.label(sig, "mono", wrap=True)
+            lbl.setTextFormat(Qt.TextFormat.PlainText)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.sections_layout.addWidget(lbl)
+        if sat.file_path:
+            line = int(getattr(sat, "line", 0) or 0)
+            where = Path(sat.file_path).name + (f":{line}" if line else "")
+            row = QWidget()
+            row.setObjectName("Transparent")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 2, 0, 2)
+            rl.setSpacing(6)
+            lbl = theme.label(f"Defined in {where}", "caption")
+            lbl.setToolTip(sat.file_path)
+            rl.addWidget(lbl)
+            btn_open = QPushButton("Open")
+            btn_open.setObjectName("LinkBtn")
+            btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_open.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            btn_open.clicked.connect(lambda checked=False, x=sat: self._open_node_path(x))
+            rl.addWidget(btn_open)
+            rl.addStretch(1)
+            self.sections_layout.addWidget(row)
+            self.sections_layout.addSpacing(6)
+        if (sat.content or "").strip():
+            self._add_section("About", [ExpandableText(sat.content, max_lines=8)])
+        calls = list(getattr(sat, "calls", []) or [])
+        called_by = list(getattr(sat, "called_by", []) or [])
+        self._add_section(f"Calls ({len(calls)})", self._ref_rows(calls, system, "→"))
+        self._add_section(f"Called by ({len(called_by)})", self._ref_rows(called_by, system, "←"))
+
+    def _render_link(self, link: PlanetLink, system: Optional[SolarSystem]) -> None:
+        p_map = {p.id: p for p in system.planets} if system else {}
+        src = p_map.get(link.source_planet_id)
+        dst = p_map.get(link.target_planet_id)
+        rel_label = RELATION_TYPES.get(link.relation_type, ("Link", ""))[0].split("(")[0].strip()
+        self.sel_chips_layout.addWidget(chip("Link"))
+        self.sel_chips_layout.addWidget(chip(rel_label))
+        self.sel_title.setText(f"{src.title if src else '?'} → {dst.title if dst else '?'}")
+        self.sel_subtitle.setText(link.label or "")
+        self.sel_subtitle.setVisible(bool(link.label))
+        self.btn_quick_delete.setText("Delete link")
+        self.btn_quick_delete.setVisible(True)
+        self.btn_edit_toggle.setText("Edit")
+
+        self.lbl_title_field.setText("Label")
+        self.edit_title.setText(link.label)
+        self.lbl_content_header.setText("Notes on this link")
+        self.edit_content.setPlainText(link.description or "")
+        self.meta_row_widget.setVisible(True)
+        self.lbl_meta.setText("Link type")
+        for r_key, (r_label, _) in RELATION_TYPES.items():
+            self.combo_meta.addItem(r_label, r_key)
+        idx = self.combo_meta.findData(link.relation_type)
+        if idx >= 0:
+            self.combo_meta.setCurrentIndex(idx)
+        self.btn_delete_node.setText("Delete link")
+        self.btn_delete_node.setEnabled(True)
+
+        rows: List[QWidget] = []
+        if src is not None:
+            rows.append(RowButton(src.title, "from", "●", on_click=lambda checked=False, x=src: self._select_and_center(x)))
+        if dst is not None:
+            rows.append(RowButton(dst.title, "to", "●", on_click=lambda checked=False, x=dst: self._select_and_center(x)))
+        self._add_section("Modules", rows)
+        if (link.description or "").strip():
+            self._add_section("Notes", [ExpandableText(link.description, max_lines=8)])
+
+    def _render_note(self, note: CanvasNote) -> None:
+        self.sel_chips_layout.addWidget(chip("Note"))
+        self.sel_title.setText(note.title)
+        self.btn_quick_delete.setText("Delete note")
+        self.btn_quick_delete.setVisible(True)
+        self.btn_edit_toggle.setText("Edit")
+        self.lbl_title_field.setText("Title")
+        self.edit_title.setText(note.title)
+        self.lbl_content_header.setText("Text")
+        self.edit_content.setPlainText(note.content)
+        self.meta_row_widget.setVisible(True)
+        self.lbl_meta.setText("Colour")
+        for label, hex_code in PLANET_COLOR_PRESETS:
+            self.combo_meta.addItem(self._dot_icon(hex_code), label, hex_code)
+        idx = self.combo_meta.findData(note.color)
+        if idx >= 0:
+            self.combo_meta.setCurrentIndex(idx)
+        self.btn_delete_node.setText("Delete note")
+        self.btn_delete_node.setEnabled(True)
+        if (note.content or "").strip():
+            self._add_section("Text", [ExpandableText(note.content, max_lines=12)])
+
+    # --- edit section ---------------------------------------------------------
+    def _set_edit_section_open(self, open_: bool) -> None:
+        self.edit_section.setVisible(bool(open_))
+        if open_:
+            QTimer.singleShot(0, lambda: self.inspector_scroll.ensureWidgetVisible(self.edit_section, 0, 40))
+            self.edit_title.setFocus()
+
+    def _mark_edit_dirty(self, *args) -> None:
+        if self._updating_ui:
+            return
+        self._set_save_primary(True)
+
+    def _set_save_primary(self, dirty: bool) -> None:
+        self._edit_dirty = dirty
+        name = "PrimaryBtn" if dirty else "SecondaryBtn"
+        if self.btn_save_node.objectName() != name:
+            self.btn_save_node.setObjectName(name)
+            theme.repolish(self.btn_save_node)
+        self.btn_save_node.setText("Save changes" if dirty else "Save")
+
+    def _cancel_edit(self) -> None:
+        if self._selected_node is not None:
+            self._load_node_into_inspector(self._selected_node, self._selected_type)
+
+    # --- skipped folders (status bar) -------------------------------------------
+    def _update_skipped_folders_link(self) -> None:
+        stats = getattr(agent_importer, "LAST_SCAN_STATS", {})
+        try:
+            total, details = skipped_folder_summary(stats)
+        except Exception:
+            total, details = 0, []
+        self._skipped_details = details
+        if total > 0:
+            self.lbl_skipped_link.setText(
+                f"· <a href='skipped' style='color:{theme.ACCENT_TEXT}; text-decoration:none;'>"
+                f"{total} folder{'s' if total != 1 else ''} skipped</a>"
+            )
+            self.lbl_skipped_link.setToolTip("Show which folders were skipped and why")
+            self.lbl_skipped_link.setVisible(True)
+        else:
+            self.lbl_skipped_link.setVisible(False)
+
+    def _show_skipped_folders_dialog(self) -> None:
+        if not self._skipped_details:
+            return
+        titles = {k: str(v.get("title", k)) for k, v in SOURCE_CATEGORIES.items()}
+        if self._skipped_dialog is not None:
+            self._skipped_dialog.close()
+            self._skipped_dialog.deleteLater()
+        dlg = SkippedFoldersDialog(self._skipped_details, titles, self)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self._skipped_dialog = dlg
+        dlg.show()
 
     def _save_current_node(self) -> None:
         if not self._selected_node:
@@ -3183,10 +4707,16 @@ class HeliosMainWindow(QMainWindow):
         self._populate_tree()
         self.canvas.rebuild_scene()
         self._update_breadcrumb()
-        self.status_label.setText("Changes saved (preserved across refreshes).")
+        if self._selected_node is not None:
+            self._load_node_into_inspector(self._selected_node, self._selected_type)
+        self.status_label.setText("Changes saved. They are kept when the project is scanned again.")
 
     def _delete_current_node(self) -> None:
         if not self._selected_node:
+            return
+        if self._selected_type == "sun" and isinstance(self._selected_node, SolarSystem):
+            # Projects are removed through the remove dialog (optionally ignoring the folder).
+            self._remove_project(self._selected_node)
             return
 
         active_sys = self.canvas.active_system
@@ -3198,16 +4728,16 @@ class HeliosMainWindow(QMainWindow):
         elif self._selected_type == "planet" and isinstance(self._selected_node, PlanetNode):
             item_label = f"module '{self._selected_node.title}'"
         elif self._selected_type == "satellite" and isinstance(self._selected_node, SatelliteNode):
-            item_label = f"sub-component '{self._selected_node.title}'"
+            item_label = f"component '{self._selected_node.title}'"
         elif self._selected_type == "link" and isinstance(self._selected_node, PlanetLink):
-            item_label = f"data flow link '{self._selected_node.label}'"
+            item_label = f"link '{self._selected_node.label}'"
         elif self._selected_type == "note" and isinstance(self._selected_node, CanvasNote):
-            item_label = f"architectural note '{self._selected_node.title}'"
+            item_label = f"note '{self._selected_node.title}'"
 
         reply = QMessageBox.question(
             self,
-            "Confirm Deletion",
-            f"Are you sure you want to delete {item_label}?\n(You can undo this action later with Ctrl+Z)",
+            "Delete",
+            f"Delete {item_label}?\nYou can undo this with Ctrl+Z.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -3216,16 +4746,7 @@ class HeliosMainWindow(QMainWindow):
 
         self.store.push_undo()
 
-        if self._selected_type == "sun" and isinstance(self._selected_node, SolarSystem):
-            if len(self.store.systems) <= 1:
-                QMessageBox.information(self, "Cannot Delete", "You cannot delete the last remaining project in the system.")
-                return
-            self._updating_ui = True
-            self.store.remove_system(self._selected_node)
-            self._updating_ui = False
-            self.canvas.enter_solar_system(self.store.systems[0])
-
-        elif self._selected_type == "planet" and isinstance(self._selected_node, PlanetNode) and active_sys:
+        if self._selected_type == "planet" and isinstance(self._selected_node, PlanetNode) and active_sys:
             active_sys.remove_planet(self._selected_node)
             self._updating_ui = True
             self.store.save()
@@ -3262,7 +4783,7 @@ class HeliosMainWindow(QMainWindow):
         self._populate_tree()
         self._refresh_sun_anchor_card()
         self._update_breadcrumb()
-        self.status_label.setText(f"Deleted {item_label} (press Ctrl+Z to undo).")
+        self.status_label.setText(f"Deleted {item_label} · Ctrl+Z to undo.")
 
     # ------------------------------------------------------------------
     # Top Bar Actions
@@ -3275,11 +4796,10 @@ class HeliosMainWindow(QMainWindow):
                 self.canvas.enter_solar_system(self.canvas.active_system)
 
     def _toggle_orbit_motion(self) -> None:
-        self.canvas.orbit_motion_enabled = not self.canvas.orbit_motion_enabled
-        if self.canvas.orbit_motion_enabled:
-            self.btn_toggle_orbit.setText("Motion: On")
-        else:
-            self.btn_toggle_orbit.setText("Motion: Off")
+        self.canvas.set_orbit_motion(not self.canvas.orbit_motion_enabled)
+        self.btn_toggle_orbit.setChecked(self.canvas.orbit_motion_enabled)
+        self.status_label.setText("Motion on: modules orbit slowly." if self.canvas.orbit_motion_enabled
+                                  else "Motion off.")
 
     def _create_new_system(self) -> None:
         dlg = NewProjectStudioDialog(self)
@@ -3328,7 +4848,7 @@ class HeliosMainWindow(QMainWindow):
         else:
             self.canvas.set_drawing_tool("select")
             self.status_label.setText(
-                f"'{clean_name}' template ready! Use the left toolbar to add new modules, data flow arrows, or notes."
+                f"'{clean_name}' is ready. Use the tools on the left of the map to add modules, links or notes."
             )
 
     def _add_planet_to_active(self) -> None:
@@ -3336,15 +4856,15 @@ class HeliosMainWindow(QMainWindow):
             return
         title, ok = QInputDialog.getText(
             self,
-            "Add New Architectural Module",
-            "Module / Layer Title:",
+            "Add module",
+            "Module name:",
         )
         if not ok or not title.strip():
             return
 
         planet = self.canvas.active_system.add_planet(
             title=title.strip(),
-            summary="Scope, responsibilities, and sub-components of this architectural module.",
+            summary="What this module is responsible for.",
             layer="core",
         )
         planet.is_user_modified = True
@@ -3374,15 +4894,15 @@ class HeliosMainWindow(QMainWindow):
         if not target_planet:
             QMessageBox.information(
                 self,
-                "Add a Module First",
-                "There must be at least one Module in the project before adding a sub-component.",
+                "Add a module first",
+                "Add a module to the project before adding components.",
             )
             return
 
         title, ok = QInputDialog.getText(
             self,
-            f"Add Sub-Component to '{target_planet.title}'",
-            "Sub-Component / Feature Title:",
+            f"Add component to '{target_planet.title}'",
+            "Component name:",
         )
         if not ok or not title.strip():
             return
@@ -3406,20 +4926,47 @@ class HeliosMainWindow(QMainWindow):
     def _analyze_codebase_folder(self) -> None:
         folder_str = QFileDialog.getExistingDirectory(
             self,
-            "Select Project Folder to Analyze",
+            "Choose a project folder to analyze",
             str(Path.home() / "Desktop"),
         )
         if not folder_str:
             return
 
         folder_path = Path(folder_str)
-        self._updating_ui = True
-        system = CodebaseImporter.analyze_directory(folder_path, self.store)
-        self._updating_ui = False
+        self._analyze_folder_path(folder_path)
+
+    def _analyze_folder_path(self, folder_path: Path) -> bool:
+        if folder_is_ignored(self.store, folder_path):
+            if not self._confirm_analyze_ignored(folder_path):
+                self.status_label.setText(f"'{folder_path.name}' is ignored; nothing was analyzed.")
+                return False
+            for entry in _covering_entries(self.store, folder_path) or [str(folder_path)]:
+                remove_ignored_folder(self.store, entry)
+            self.status_label.setText(f"'{folder_path.name}' is no longer ignored.")
+        worker = CodebaseScanWorker(self.store, folder=folder_path)
+        if not self._run_store_worker(
+            worker, self._on_codebase_folder_analyzed, f"Analyzing codebase '{folder_path.name}'..."
+        ):
+            QMessageBox.information(
+                self,
+                "Scan already running",
+                "Another scan is running. Please wait for it to finish.",
+            )
+            return False
+        return True
+
+    def _on_codebase_folder_analyzed(self, ok: bool, msg: str, payload: object) -> None:
+        if not ok:
+            self.status_label.setText(msg)
+            QMessageBox.warning(self, "Analysis failed", msg)
+            return
+        data = payload if isinstance(payload, dict) else {}
+        system = data.get("system")
+        folder_path = Path(data.get("folder") or ".")
         if not system:
             QMessageBox.warning(
                 self,
-                "No Files Found to Analyze",
+                "Nothing to analyze",
                 f"No supported source code or Markdown files were found in '{folder_path.name}'.",
             )
             return
@@ -3428,24 +4975,38 @@ class HeliosMainWindow(QMainWindow):
         self._populate_tree()
         self._refresh_sun_anchor_card()
         self.status_label.setText(
-            f"Codebase '{system.project_name}' analyzed ({len(system.planets)} layers, {len(system.links)} links)."
+            f"'{system.project_name}' analyzed: {len(system.planets)} modules, {len(system.links)} links."
         )
+        # Purpose first (if missing), then the module descriptions.
+        self._maybe_auto_suggest_purposes(then_modules_id=system.id)
 
     def _sync_agent_histories(self) -> None:
-        self._updating_ui = True
         connected = self.store.get_setting("connected_sources", ["antigravity", "codebase"])
-        if isinstance(connected, list) and connected:
-            updated = AgentHistoryImporter.scan_selected_sources(self.store, connected, max_sessions=30)
-        else:
-            updated = 0
-        self._updating_ui = False
-        self._populate_tree()
-        self.canvas.rebuild_scene()
-        self._refresh_sun_anchor_card()
+        sources = list(connected) if isinstance(connected, list) and connected else []
+        worker = AgentSyncWorker(self.store, sources, max_sessions=30)
+        if not self._run_store_worker(
+            worker, self._on_agent_histories_synced, "Scanning connected AI tool histories..."
+        ):
+            QMessageBox.information(
+                self,
+                "Scan already running",
+                "Another scan is running. Please wait for it to finish.",
+            )
+
+    def _on_agent_histories_synced(self, ok: bool, msg: str, payload: object) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        connected = data.get("sources")
+        if connected is None:
+            connected = self.store.get_setting("connected_sources", ["antigravity", "codebase"])
+        if not ok:
+            self.status_label.setText(msg)
+            QMessageBox.warning(self, "Sync failed", msg)
+            return
+        updated = data.get("updated", 0)
         conn_str = ", ".join(str(c).title() for c in (connected if isinstance(connected, list) else []))
         QMessageBox.information(
             self,
-            "AI Agent Histories Synchronized",
+            "AI tools synced",
             f"Scanned connected AI tools ({conn_str or 'None'}).\n"
             f"Projects updated while preserving user edits: {updated}",
         )
