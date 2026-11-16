@@ -96,6 +96,8 @@ SUGGESTION_CARD_COLOR = MUTED  # "Suggested: …" line on project cards
 MAP_MIN_TITLE_PX = 10.5
 # Margin (scene px) around the map when fitting it to the view.
 MAP_FIT_MARGIN = 22.0
+# Margin (scene px) around the map in an exported image.
+EXPORT_MARGIN = 48
 
 MONO_FAMILIES = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Menlo", "monospace")
 
@@ -376,6 +378,46 @@ QFrame#EmptyState {{
     border: 1px solid {HAIRLINE};
     border-radius: 12px;
 }}
+QFrame#WelcomePanel {{
+    background-color: {PANEL};
+    border: 1px solid {HAIRLINE};
+    border-radius: {RADIUS_L + 4}px;
+}}
+QFrame#WelcomeStep {{
+    background-color: {RAISED};
+    border-radius: {RADIUS_L}px;
+}}
+QLabel#WelcomeNumber {{
+    background-color: {ACCENT_SOFT};
+    color: {ACCENT_TEXT};
+    border-radius: 11px;
+    font-size: {FS_SMALL}px;
+    font-weight: 600;
+}}
+QLabel#WelcomeStepTitle {{ font-weight: 600; }}
+QFrame#WelcomeStep QPushButton#SecondaryBtn {{ background-color: {HOVER}; }}
+QFrame#WelcomeStep QPushButton#SecondaryBtn:hover {{ background-color: {PRESSED}; }}
+QFrame#FilterPopover {{
+    background-color: {RAISED};
+    border: 1px solid {HAIRLINE};
+    border-radius: {RADIUS_L}px;
+}}
+QFrame#FilterBanner {{
+    background-color: {rgba(PANEL, 0.96)};
+    border: 1px solid {HAIRLINE};
+    border-radius: 14px;
+}}
+QFrame#SearchPopup {{
+    background-color: {RAISED};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: {RADIUS_L}px;
+}}
+QListWidget#SearchResults {{
+    background: transparent;
+    border: none;
+    outline: 0;
+    color: {TEXT};
+}}
 QWidget#Transparent, QWidget#InspectorBody {{
     background: transparent;
 }}
@@ -413,6 +455,10 @@ QPushButton#QuietBtn, QPushButton#SubtleBtn, QPushButton#OllamaBtn {{
 QPushButton#QuietBtn:hover, QPushButton#SubtleBtn:hover, QPushButton#OllamaBtn:hover {{
     background-color: {HOVER};
     color: {TEXT};
+}}
+QPushButton#QuietBtn[active="true"] {{
+    background-color: {ACCENT_SOFT};
+    color: {ACCENT_TEXT};
 }}
 QPushButton#QuietBtn:checked, QPushButton#SubtleBtn:checked {{
     background-color: {ACCENT_SOFT};

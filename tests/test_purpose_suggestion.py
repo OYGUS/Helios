@@ -276,3 +276,27 @@ def test_every_writer_writes_the_version(tmp_path):
     assert saved["format_version"] == 2
     row = next(s for s in saved["systems"] if s["project_name"] == "AiProj")
     assert row["purpose"] == "" and row["purpose_suggestion"] == "A photo renamer."
+
+
+def test_pending_suggestion_hidden_without_ollama_or_when_stale():
+    s = SolarSystem(name="Shutter", project_name="Shutter")
+    s.purpose_evidence = STRONG
+    assert ps.set_purpose_suggestion(s, "A photo renamer.")
+    assert ps.suggestion_is_current(s)
+    assert ps.pending_suggestion(s) == "A photo renamer."
+    assert ps.pending_suggestion(s, ai_available=True) == "A photo renamer."
+    # Ollama off: nothing to show, but the stored data is untouched.
+    assert ps.pending_suggestion(s, ai_available=False) == ""
+    assert s.purpose_suggestion == "A photo renamer." and s.purpose_suggestion_key == evidence_key(STRONG)
+    # Evidence changed: stale, not shown and not accepted; an automatic run may ask again.
+    s.purpose_evidence = STRONG2
+    assert not ps.suggestion_is_current(s)
+    assert ps.pending_suggestion(s) == ""
+    assert not ps.accept_purpose_suggestion(s) and s.purpose == ""
+    assert ps.needs_auto_suggestion(s)
+    # Back to the evidence it was made from: shown again.
+    s.purpose_evidence = STRONG
+    assert ps.pending_suggestion(s) == "A photo renamer."
+    # A suggestion without a key is not known to match the evidence.
+    s.purpose_suggestion_key = ""
+    assert ps.pending_suggestion(s) == ""

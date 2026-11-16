@@ -916,6 +916,7 @@ def test_fit_view_and_idle_timer(env):
 from PySide6.QtCore import Signal as _Signal  # noqa: E402
 
 from ui import main_window as mw  # noqa: E402
+from ui.window import ollama_runs  # noqa: E402  (reads the Ollama worker classes)
 
 
 def _purpose_window(env, n_extra=0):
@@ -942,7 +943,8 @@ def test_purpose_header_text_source_tags_and_placeholder(env):
     text = "A local voice assistant that listens through the microphone and runs PC commands."
     expected = {
         "user": "Written by you",
-        "readme": "From the project's README",
+        # changed: a "readme" purpose without a known origin (old data) gets a neutral label.
+        "readme": "From the project's description",
         "ai": "AI suggestion you accepted",  # changed: "ai" now means an accepted suggestion
     }
     for source, tag in expected.items():
@@ -1056,6 +1058,7 @@ def test_search_matches_project_purpose(env):
     system.purpose = "A voice assistant for the desktop."
     win._populate_tree()
     win.search_input.setText("voice assistant")
+    win.search_ctl.flush()  # typing is debounced
     root = win.hierarchy_tree.invisibleRootItem()
     visible = [root.child(i).text(0) for i in range(root.childCount()) if not root.child(i).isHidden()]
     assert visible == ["NOVA"]
@@ -1190,8 +1193,8 @@ def fake_ollama(monkeypatch):
     _FakeCheckWorker.created = []
     _FakeCheckWorker.answer = True
     _FakeOllamaWorker.created = []
-    monkeypatch.setattr(mw, "OllamaServerCheckWorker", _FakeCheckWorker)
-    monkeypatch.setattr(mw, "OllamaEnhanceWorker", _FakeOllamaWorker)
+    monkeypatch.setattr(ollama_runs, "OllamaServerCheckWorker", _FakeCheckWorker)
+    monkeypatch.setattr(ollama_runs, "OllamaEnhanceWorker", _FakeOllamaWorker)
     return {"check": _FakeCheckWorker, "worker": _FakeOllamaWorker}
 
 
@@ -1382,7 +1385,7 @@ def test_purpose_only_not_started_with_an_old_worker(env, monkeypatch):
                      describe_modules=True, summarize_project=True):
             super().__init__(systems, model_name, parent, force, language, describe_modules, summarize_project)
 
-    monkeypatch.setattr(mw, "OllamaEnhanceWorker", OldWorker)
+    monkeypatch.setattr(ollama_runs, "OllamaEnhanceWorker", OldWorker)
     win, system, _ = _purpose_window(env)
     system.purpose_evidence = "README intro (README.md): x"
     win._detected_ollama_model = "m:1"
@@ -1454,7 +1457,7 @@ def test_remove_last_project_leaves_empty_state(env, monkeypatch):
     win._remove_project(system)
     assert win.store.systems == []
     assert win.canvas.active_system is None
-    assert win.canvas.empty_overlay.isVisible() and win.canvas.empty_overlay.mode == "no_projects"
+    assert win.canvas.welcome_panel.isVisible() and not win.canvas.empty_overlay.isVisible()
     assert win.sun_title_display.text() == "No project yet"
     assert not win.purpose_view.isVisible() and not win.purpose_empty.isVisible()
     assert win.hierarchy_tree.topLevelItemCount() == 0
@@ -1789,6 +1792,7 @@ def test_identity_line_in_header_cards_tooltips_and_search(env):
     win.canvas.viewport().grab()  # paints without errors
     # Search matches the identity line (cards and tree).
     win.search_input.setText("web server")
+    win.search_ctl.flush()  # typing is debounced
     dimmed = {c.system.id: c.is_dimmed for c in win.canvas.galaxy_items}
     assert dimmed[other.id] is False and dimmed[system.id] is True
     root = win.hierarchy_tree.invisibleRootItem()
@@ -1806,10 +1810,15 @@ def test_identity_line_in_header_cards_tooltips_and_search(env):
 # ----------------------------------------------------------------------
 # AI purpose suggestions in the header and on cards
 # ----------------------------------------------------------------------
-def _suggestion_window(env, ollama=False):
+def _suggestion_window(env, ollama=True):
+    # changed: default ollama=True, because suggestions are only shown with Ollama available,
+    # and the suggestion carries the key of the evidence it was made from (else it is stale).
+    from connectors.purpose_evidence import evidence_key
+
     win, system, extras = _purpose_window(env, n_extra=1)
     system.purpose_evidence = "Own description (package.json): A local voice assistant for the desktop."
     system.purpose_suggestion = "A local voice assistant that runs PC commands."
+    system.purpose_suggestion_key = evidence_key(system.purpose_evidence)
     win.store.set_setting("disable_ollama", not ollama)
     win._detected_ollama_model = "m:1" if ollama else None
     win._refresh_ai_controls()
@@ -1913,14 +1922,34 @@ def test_ollama_off_means_no_ai_controls_anywhere(env):
     menu = QtWidgets.QMenu()
     win._project_menu_actions(menu, system)
     assert [a.text() for a in menu.actions()] == ["Edit purpose", "Show what this is based on"]
-    # A pending suggestion is still shown (it is data, not an AI control).
-    assert win.suggestion_box.isVisible()
-    # On: the controls come back.
+    # changed: a stored suggestion is not shown without Ollama (header, cards, tooltips),
+    # but stays on disk; the empty-purpose line is shown instead.
+    assert not win.suggestion_box.isVisible() and win.purpose_empty.isVisible()
+    assert system.purpose_suggestion == "A local voice assistant that runs PC commands."
+    assert win._accept_purpose_suggestion() is False and win._dismiss_purpose_suggestion() is False
+    assert system.purpose == "" and system.purpose_dismissed_key == ""
+    win.canvas.switch_to_galaxy_view()
+    card = next(c for c in win.canvas.galaxy_items if c.system.id == system.id)
+    assert card.suggestion_text() == "" and "Suggested" not in card.toolTip()
+    win.canvas.enter_solar_system(system)
+    spin(0.05)
+    # On: the controls and the (still current) suggestion come back.
     win.store.set_setting("disable_ollama", False)
     win._detected_ollama_model = "m:1"
     win._refresh_ai_controls()
     win._refresh_sun_anchor_card()
     assert win.btn_ollama_single.isVisible() and win.canvas.ai_available is True
+    assert win.suggestion_box.isVisible() and not win.purpose_empty.isVisible()
+    win.canvas.switch_to_galaxy_view()
+    card = next(c for c in win.canvas.galaxy_items if c.system.id == system.id)
+    assert card.suggestion_text().startswith("Suggested: ")
+    # Turning Ollama off refreshes the cards already on screen.
+    win.store.set_setting("disable_ollama", True)
+    win._refresh_ai_controls()
+    assert card.suggestion_text() == "" and "Suggested" not in card.toolTip()
+    win.store.set_setting("disable_ollama", False)
+    win._refresh_ai_controls()
+    assert card.suggestion_text().startswith("Suggested: ")
     assert win.lbl_ollama_status.text() == "Ollama: m:1"
     menu2 = QtWidgets.QMenu()
     win._project_menu_actions(menu2, system)
@@ -1974,9 +2003,66 @@ def test_migration_notice_is_shown_once_after_startup(env, tmp_path):
     store.set_setting("connected_sources", [])
     win = mw.HeliosMainWindow(store=store)
     win.show()
+    # changed: without Ollama suggestions are not shown, so the notice waits for Ollama.
+    wait_until(lambda: getattr(win, "_migration_notice_due", False), timeout=5)
+    assert "now shown as" not in win.status_label.text()
+    win._detected_ollama_model = "m:1"
+    win._refresh_ai_controls()
     wait_until(lambda: "now shown as" in win.status_label.text(), timeout=5)
     assert win.status_label.text().startswith("1 project description written by Ollama is now shown as")
     win.status_label.setText("other")
     spin(0.3)
     assert win.status_label.text() == "other", "one-time"
     win.close()
+
+
+def test_startup_with_empty_store_shows_empty_state(env):
+    import json as _json
+
+    path = env["tmp"] / "galaxy.json"
+    path.write_text(_json.dumps({"format_version": 2, "systems": []}), encoding="utf-8")
+    store = GalaxyStore(storage_path=path)
+    assert store.systems == []
+    win = env["make_window"](store=store, onboarded=False)
+    win.show()
+    spin(0.3)
+    win._switch_to_page("studio")
+    spin(0.05)
+    assert win.store.systems == []
+    assert win.canvas.active_system is None
+    assert win.canvas.welcome_panel.isVisible() and not win.canvas.empty_overlay.isVisible()
+    assert win.sun_title_display.text() == "No project yet"
+    assert win.hierarchy_tree.topLevelItemCount() == 0
+    assert env["boxes"]["critical"].calls == []
+
+
+def test_purpose_label_names_readme_or_package_description(env):
+    win, system, _ = _purpose_window(env)
+    system.purpose, system.purpose_source = "Tracks a daily poetry streak.", "readme"
+    for origin, tag in (
+        ("readme", "From the project's README"),
+        ("package", "From the project's package description"),
+        ("", "From the project's description"),
+        ("something-new", "From the project's description"),
+    ):
+        system.purpose_origin = origin
+        win._refresh_sun_anchor_card()
+        assert win.lbl_purpose_source.text() == tag
+    # The origin is ignored for other sources.
+    system.purpose_source, system.purpose_origin = "user", "package"
+    win._refresh_sun_anchor_card()
+    assert win.lbl_purpose_source.text() == "Written by you"
+
+
+def test_stale_suggestion_is_not_shown_even_with_ollama(env):
+    win, system, _ = _suggestion_window(env, ollama=True)
+    assert win.suggestion_box.isVisible()
+    # A re-scan changed the evidence: the stored suggestion no longer belongs to it.
+    system.purpose_evidence = "Own description (package.json): A desktop timer that tracks study sessions."
+    win._refresh_sun_anchor_card()
+    assert not win.suggestion_box.isVisible() and win.purpose_empty.isVisible()
+    assert win._accept_purpose_suggestion() is False
+    assert system.purpose == "" and system.purpose_suggestion  # kept on disk, just not shown
+    win.canvas.switch_to_galaxy_view()
+    card = next(c for c in win.canvas.galaxy_items if c.system.id == system.id)
+    assert card.suggestion_text() == ""

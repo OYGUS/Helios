@@ -11,10 +11,12 @@ import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from core import paths as app_paths
 
 
 def generate_id() -> str:
@@ -163,6 +165,12 @@ class SatelliteNode:
     # "<module title>::<sub-component title>" references (e.g. "mikrofon.py::dinle_ve_yaz()").
     calls: List[str] = field(default_factory=list)
     called_by: List[str] = field(default_factory=list)
+    # Every definition the analysis found in this component's file, before any display
+    # clipping: "name()" (function), "class Name" / "interface Name" (class-like),
+    # "Class.method()" (method). Analysis-owned: replaced on every scan, never shown raw,
+    # never user data; at most `connectors.codebase.constants.DEFINED_NAMES_CAP` entries.
+    # Used by the search box; old data without it falls back to the "Defines:" line.
+    defined_names: List[str] = field(default_factory=list)
 
     @property
     def orbit_angle(self) -> float:
@@ -230,6 +238,9 @@ class PlanetNode:
     # True for the module where the program starts (e.g. the file with the
     # `if __name__ == "__main__"` block, `main.py`, the package.json "main").
     is_entry: bool = False
+    # Same as `SatelliteNode.defined_names`, for a module that is one file (file-level
+    # maps), so definitions not shown as components stay searchable.
+    defined_names: List[str] = field(default_factory=list)
     satellites: List[SatelliteNode] = field(default_factory=list)
     created_at: str = field(default_factory=current_timestamp)
 
@@ -357,6 +368,11 @@ class SolarSystem:
     # and recomputed (replaced) on every scan. "" = not scanned yet (the UI then derives a
     # best-effort value from the stored analysis facts, see `stored_identity`).
     identity: str = ""
+    # Which of the project's own words a "readme" purpose was taken from: "readme" (the
+    # README intro), "package" (a package description such as pyproject.toml or
+    # package.json) or "" (unknown, e.g. data saved before this field existed). Only
+    # meaningful while `purpose_source == "readme"`.
+    purpose_origin: str = ""
     planets: List[PlanetNode] = field(default_factory=list)
     links: List[PlanetLink] = field(default_factory=list)
     notes: List[CanvasNote] = field(default_factory=list)
@@ -489,6 +505,8 @@ class SolarSystem:
                         target_p.summary = p.summary
                     elif len(p.summary) > len(target_p.summary):
                         target_p.summary = p.summary
+                if p.defined_names and len(p.defined_names) > len(target_p.defined_names):
+                    target_p.defined_names = list(p.defined_names)
                 for sat in p.satellites:
                     target_p.satellites.append(sat)
                 if p.is_user_modified:
@@ -509,6 +527,8 @@ class SolarSystem:
                         target_s.file_path = s.file_path
                     if s.content and len(s.content) > len(target_s.content):
                         target_s.content = s.content
+                    if s.defined_names and len(s.defined_names) > len(target_s.defined_names):
+                        target_s.defined_names = list(s.defined_names)
                     if s.is_user_modified:
                         target_s.is_user_modified = True
             p.satellites = list(unique_sats.values())
@@ -764,9 +784,19 @@ class SolarSystem:
             self.rebuild_links_and_tour()
 
     def find_parent_planet(self, sat: SatelliteNode) -> Optional[PlanetNode]:
+        """The first module whose components contain `sat` (``in``: the object itself or an
+        equal one). Equal components always have the same id, so other ids are skipped
+        without the field-by-field dataclass comparison."""
+        if type(sat) is not SatelliteNode:
+            for p in self.planets:
+                if sat in p.satellites:
+                    return p
+            return None
+        sid = sat.id
         for p in self.planets:
-            if sat in p.satellites:
-                return p
+            for s in p.satellites:
+                if s is sat or (s.id == sid and s == sat):
+                    return p
         return None
 
     def rebalance_layout(self, force: bool = False) -> None:
@@ -885,23 +915,30 @@ def file_format_version(raw: object) -> int:
     return value
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    """Writes `text` (UTF-8) to `path` atomically.
+def atomic_write_text(path: Path, text: str) -> os.stat_result:
+    """Writes `text` (UTF-8) to `path` atomically (see `atomic_write_bytes`)."""
+    return atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> os.stat_result:
+    """Writes `data` to `path` atomically.
 
     The data goes to a temp file in the same directory, is flushed and fsynced,
     then moved over the target with `os.replace`, so readers (e.g. the GUI file
     watcher) see either the old or the new file, never a half-written one.
     On Windows `os.replace` can briefly fail with PermissionError while another
     process holds the target open, so it is retried a few times.
+    Returns the `os.fstat` of the written data (taken before the move; callers may ignore it).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(text.encode("utf-8"))
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+            written = os.fstat(fh.fileno())
         for attempt in range(10):
             try:
                 os.replace(tmp_name, str(path))
@@ -916,6 +953,55 @@ def atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+    return written
+
+
+def file_identity(st: Optional[os.stat_result]) -> Optional[Tuple[int, int, int, int]]:
+    """(inode, device, size, mtime_ns) of a stat result, or None when the platform reports
+    no inode number (then the identity cannot tell two files apart and is not used)."""
+    if st is None or not getattr(st, "st_ino", 0):
+        return None
+    return (st.st_ino, st.st_dev, st.st_size, st.st_mtime_ns)
+
+
+def _path_identity(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        return file_identity(os.stat(path))
+    except OSError:
+        return None
+
+
+# Field names per dataclass type, in declaration order (what `dataclasses.asdict` emits).
+_JSON_FIELD_NAMES: Dict[type, Tuple[str, ...]] = {}
+
+
+def _dataclass_json_default(obj: object) -> Dict[str, object]:
+    """`json.dumps(..., default=)` hook: a dataclass instance as the dict `asdict` would
+    build for it (same keys, same order). Nested dataclasses, lists and dicts are left to
+    the encoder, so the JSON text is byte-identical to `json.dumps(asdict(obj))` while the
+    C encoder does the walking instead of `asdict`'s recursive deep copy."""
+    names = _JSON_FIELD_NAMES.get(type(obj))
+    if names is None:
+        if not is_dataclass(obj) or isinstance(obj, type):
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+        names = tuple(f.name for f in fields(obj))
+        _JSON_FIELD_NAMES[type(obj)] = names
+    attrs = getattr(obj, "__dict__", None)
+    if attrs is not None and tuple(attrs) == names:
+        # The instance dict holds exactly the fields, in declaration order (what
+        # `__init__` assigns): the encoder can read it as it is (it never changes it).
+        return attrs
+    return {name: getattr(obj, name) for name in names}
+
+
+def dumps_compact(obj: object) -> str:
+    """`json.dumps(asdict-converted obj, ensure_ascii=False)` without building the dicts first."""
+    return json.dumps(obj, ensure_ascii=False, default=_dataclass_json_default)
+
+
+def dumps_indented(obj: object) -> str:
+    """`json.dumps(asdict-converted obj, ensure_ascii=False, indent=2)` (see `dumps_compact`)."""
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=_dataclass_json_default)
 
 
 class GalaxyStore:
@@ -935,17 +1021,27 @@ class GalaxyStore:
     """
 
     def __init__(self, storage_path: Optional[Path] = None) -> None:
-        base_dir = Path(__file__).resolve().parent.parent
         if storage_path:
             self.file_path = Path(storage_path)
             self.data_dir = self.file_path.parent
         else:
-            self.data_dir = base_dir / "data"
+            self.data_dir = app_paths.data_dir()
             self.file_path = self.data_dir / "galaxy.json"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.settings_path = self.data_dir / "settings.json"
         self.systems: List[SolarSystem] = []
         self.last_written_text: str = ""
+        # (inode, device, size, mtime_ns) of the galaxy.json this store last wrote or read,
+        # so `is_own_write` can answer without reading the file back (see there).
+        self._own_file_identity: Optional[Tuple[int, int, int, int]] = None
+        # Compact JSON of a project -> its indented block in galaxy.json, from the last save
+        # (unchanged projects are not re-indented; see `_galaxy_text`).
+        self._indented_blocks: Dict[str, str] = {}
+        # settings.json as last read or written: (file identity, parsed data).
+        self._settings_cache: Optional[Tuple[object, object]] = None
+        # Bumped whenever the projects were saved or (re)loaded: views built from the
+        # store compare it to know whether their data is still current (see the tree).
+        self.data_version: int = 0
         self.load_error: Optional[str] = None
         self.backup_path: Optional[Path] = None
         self._loaded_once = False
@@ -962,29 +1058,70 @@ class GalaxyStore:
     # ------------------------------------------------------------------
     # Settings Management (settings.json)
     # ------------------------------------------------------------------
+    _SETTINGS_MISSING = object()  # settings.json does not exist
+    _SETTINGS_UNREADABLE = object()  # settings.json exists but is not valid JSON
+
+    def _settings_data(self) -> object:
+        """The parsed settings.json (or one of the two markers above), cached in memory.
+
+        The cache is keyed by the file's identity (inode, device, size, mtime_ns), so a
+        change made by another process (another Helios, the user's editor) is read on the
+        next call; `set_setting` writes through. Without an inode number (some platforms)
+        nothing is cached and the file is read every time, as before.
+        """
+        try:
+            st = os.stat(self.settings_path)
+        except FileNotFoundError:
+            return self._SETTINGS_MISSING
+        except OSError:
+            st = None
+        ident = file_identity(st)
+        cached = self._settings_cache
+        if ident is not None and cached is not None and cached[0] == ident:
+            return cached[1]
+        if st is None and not self.settings_path.exists():
+            return self._SETTINGS_MISSING
+        try:
+            data: object = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return self._SETTINGS_MISSING
+        except Exception:
+            data = self._SETTINGS_UNREADABLE
+        self._settings_cache = (ident, data) if ident is not None else None
+        return data
+
     def get_setting(self, key: str, default: object = None) -> object:
-        """Reads a setting from local settings.json."""
-        if not self.settings_path.exists():
+        """Reads a setting from local settings.json (cached; see `_settings_data`).
+
+        Returns a copy of lists / dicts, so callers may change what they get without
+        touching the cache (as when every call parsed the file)."""
+        data = self._settings_data()
+        if data is self._SETTINGS_MISSING or data is self._SETTINGS_UNREADABLE:
             return default
         try:
-            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            return data.get(key, default)
+            value = data.get(key, default)  # type: ignore[union-attr]
         except Exception:
             return default
+        if isinstance(value, (list, dict)):
+            return copy.deepcopy(value)
+        return value
 
     def set_setting(self, key: str, value: object) -> None:
-        """Writes a setting to local settings.json."""
-        data: Dict[str, object] = {}
-        if self.settings_path.exists():
-            try:
-                data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
+        """Writes a setting to local settings.json (and the in-memory cache)."""
+        current = self._settings_data()
+        if current is self._SETTINGS_MISSING or current is self._SETTINGS_UNREADABLE:
+            data: Dict[str, object] = {}
+        else:
+            data = copy.deepcopy(current)  # type: ignore[assignment]
         data[key] = value
         try:
-            atomic_write_text(self.settings_path, json.dumps(data, ensure_ascii=False, indent=2))
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            written = atomic_write_text(self.settings_path, text)
         except Exception:
-            pass
+            self._settings_cache = None
+            return
+        ident = file_identity(written)
+        self._settings_cache = (ident, json.loads(text)) if ident is not None else None
 
     def merge_systems(self, primary: SolarSystem, others: List[SolarSystem]) -> Tuple[int, int]:
         """Merges secondary projects (`others`) into `primary`.
@@ -1115,12 +1252,24 @@ class GalaxyStore:
     # ------------------------------------------------------------------
     # Undo (Ctrl+Z) / Redo (Ctrl+Y) History
     # ------------------------------------------------------------------
+    def _snapshot_parts(self) -> Tuple[str, ...]:
+        """The projects as compact JSON, one string per project (store order). A string
+        equal to one of the previous undo snapshot is replaced by that very object, so
+        snapshots share the text of unchanged projects (memory)."""
+        parts = tuple(dumps_compact(s) for s in self.systems)
+        previous = self._undo_stack[-1] if self._undo_stack else ()
+        if previous:
+            known = {p: p for p in previous}
+            parts = tuple(known.get(p, p) for p in parts)
+        return parts
+
     def _snapshot(self) -> str:
-        return json.dumps([asdict(s) for s in self.systems], ensure_ascii=False)
+        # Same text as json.dumps([asdict(s) for s in self.systems], ensure_ascii=False).
+        return "[" + ", ".join(self._snapshot_parts()) + "]"
 
     def push_undo(self) -> None:
         """Pushes the current state onto the undo stack prior to a modification."""
-        snap = self._snapshot()
+        snap = self._snapshot_parts()
         if self._undo_stack and self._undo_stack[-1] == snap:
             return
         self._undo_stack.append(snap)
@@ -1137,35 +1286,74 @@ class GalaxyStore:
     def undo(self) -> bool:
         if not self._undo_stack:
             return False
-        self._redo_stack.append(self._snapshot())
-        self._restore_snapshot(self._undo_stack.pop())
+        current = self._snapshot_parts()
+        self._redo_stack.append(current)
+        self._restore_snapshot(self._undo_stack.pop(), current)
         return True
 
     def redo(self) -> bool:
         if not self._redo_stack:
             return False
-        self._undo_stack.append(self._snapshot())
-        self._restore_snapshot(self._redo_stack.pop())
+        current = self._snapshot_parts()
+        self._undo_stack.append(current)
+        self._restore_snapshot(self._redo_stack.pop(), current)
         return True
 
-    def _restore_snapshot(self, snap: str) -> None:
-        data_list = json.loads(snap)
-        restored = [s for s in (self._parse_system(d) for d in data_list) if s is not None]
-        if restored:
+    def _restore_snapshot(self, snap, current: Optional[Tuple[str, ...]] = None) -> None:
+        """Replaces the projects with a snapshot (a `_snapshot_parts` tuple, or the joined
+        JSON text) and saves.
+
+        The result equals parsing the whole snapshot (`_parse_system` for every project,
+        then saving), but a project whose JSON in the snapshot equals the JSON of a project
+        in the store right now (`current`, taken from `self.systems` just before) keeps
+        that object: it holds exactly that data, and gets the same `rebuild_links_and_tour`
+        a parsed copy gets. Only the projects whose text differs are parsed. Callers must
+        treat every object as replaced (as before): see `HistoryMixin._on_undo`."""
+        if isinstance(snap, str):
+            data_list = json.loads(snap)
+            restored = [s for s in (self._parse_system(d) for d in data_list) if s is not None]
+            if restored or not data_list:
+                self.systems = restored
+            self.save()
+            return
+        pool: Dict[str, List[SolarSystem]] = {}
+        if current is not None and len(current) == len(self.systems):
+            for text, system in zip(current, self.systems):
+                pool.setdefault(text, []).append(system)
+        restored = []
+        for text in snap:
+            same = pool.get(text)
+            if same:
+                system = same.pop(0)
+                if self._dropped_on_load(system.source, system.source_id, system.name):
+                    continue
+                system.rebuild_links_and_tour()
+                restored.append(system)
+                continue
+            parsed = self._parse_system(json.loads(text))
+            if parsed is not None:
+                restored.append(parsed)
+        if restored or not snap:
+            # An empty snapshot is a real state (no projects), not a parse failure.
             self.systems = restored
         self.save()
 
     @staticmethod
-    def _parse_system(sys_data: dict) -> Optional[SolarSystem]:
-        """Converts a JSON dictionary into a SolarSystem instance."""
-        sid = str(sys_data.get("source_id", ""))
-        sname = str(sys_data.get("name", ""))
-        if sys_data.get("source") == "codex" and (
+    def _dropped_on_load(source: object, source_id: object, name: object) -> bool:
+        """Projects `_parse_system` never loads (old Codex internals, prefixed duplicates)."""
+        sid = str(source_id)
+        sname = str(name)
+        if source == "codex" and (
             sid.startswith(".codex")
             or sid in {"plugin", "marketplace", "skills-curated-cache", "models_cache"}
         ):
-            return None
-        if sname.startswith(("[Antigravity] ", "[Codex] ", "[Claude Code] ")):
+            return True
+        return sname.startswith(("[Antigravity] ", "[Codex] ", "[Claude Code] "))
+
+    @staticmethod
+    def _parse_system(sys_data: dict) -> Optional[SolarSystem]:
+        """Converts a JSON dictionary into a SolarSystem instance."""
+        if GalaxyStore._dropped_on_load(sys_data.get("source"), sys_data.get("source_id", ""), sys_data.get("name", "")):
             return None
 
         planets: List[PlanetNode] = []
@@ -1208,17 +1396,22 @@ class GalaxyStore:
     def load(self) -> bool:
         """Loads projects from disk. Returns True on success.
 
+        Every call bumps `data_version` (the in-memory projects may have been replaced).
+
         - Missing file on first load: creates the starter project and saves it.
+        - Readable file with an empty `systems` list: stays empty (the user removed
+          every project); the starter project is not re-created.
         - Missing file on reload: keeps the in-memory projects, returns False.
         - Unreadable / invalid file on first load: copies it to
           `galaxy.corrupt-YYYYmmdd-HHMMSS.json` (`self.backup_path`), then falls
-          back to the starter project. If the backup cannot be written, the
-          starter project is still shown but `save()` refuses to overwrite the file.
+          back to the starter project (no projects when frozen). If the backup cannot
+          be written, that fallback is still shown but `save()` refuses to overwrite the file.
         - Unreadable / invalid file on reload: keeps the in-memory projects and
           does not touch the disk.
         `self.load_error` holds a readable message on failure, None on success.
         """
         first_load = not self._loaded_once
+        self.data_version += 1
 
         if not self.file_path.exists():
             if not first_load:
@@ -1226,13 +1419,16 @@ class GalaxyStore:
                 return False
             self._loaded_once = True
             self.load_error = None
-            self.systems = [self._create_starter_system()]
+            # A frozen build has no Helios source folder to map: start with no projects.
+            self.systems = [] if app_paths.is_frozen() else [self._create_starter_system()]
             self.recalculate_galaxy_sectors()
             self.save()
             return True
 
         try:
-            raw_bytes = self.file_path.read_bytes()
+            with open(self.file_path, "rb") as fh:
+                read_identity = file_identity(os.fstat(fh.fileno()))
+                raw_bytes = fh.read()
             text = raw_bytes.decode("utf-8")
             raw = json.loads(text)
             if not isinstance(raw, dict) or not isinstance(raw.get("systems", []), list):
@@ -1256,12 +1452,10 @@ class GalaxyStore:
                     f"{message}. Backup failed ({backup_exc}); refusing to overwrite the file."
                 )
                 self.load_error = self._write_blocked_reason
-            self.systems = [self._create_starter_system()]
+            self.systems = [] if app_paths.is_frozen() else [self._create_starter_system()]
             self.recalculate_galaxy_sectors()
             return False
 
-        if first_load and not loaded:
-            loaded = [self._create_starter_system()]
         self.loaded_format_version = file_format_version(raw)
         self.migrated_purposes = 0
         if self.loaded_format_version < GALAXY_FORMAT_VERSION:
@@ -1274,6 +1468,9 @@ class GalaxyStore:
         self.recalculate_galaxy_sectors()
         # Normalize line endings like Path.read_text so is_own_write() comparisons match.
         self.last_written_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Only when the bytes are exactly that text: otherwise `is_own_write` compares
+        # the (newline-normalized) text as before.
+        self._own_file_identity = read_identity if self.last_written_text == text else None
         self.load_error = None
         self._write_blocked_reason = None
         return True
@@ -1351,21 +1548,66 @@ class GalaxyStore:
             )
         )
 
+    def _galaxy_text(self) -> str:
+        """The galaxy.json text: byte-identical to
+
+            json.dumps({"format_version": ..., "updated_at": ..., "systems": [asdict(s) ...]},
+                       ensure_ascii=False, indent=2)
+
+        but each project's indented block is reused from the previous save when the
+        project's compact JSON is unchanged (indenting is the slow part of `json.dumps`
+        before Python 3.13). The compact JSON is the comparison key, so no field of an
+        unchanged project can be missed."""
+        blocks: Dict[str, str] = {}
+        previous = self._indented_blocks
+        parts: List[str] = []
+        for system in self.systems:
+            compact = dumps_compact(system)
+            block = previous.get(compact)
+            if block is None:
+                block = blocks.get(compact)
+            if block is None:
+                # A project sits at depth 2 ("systems" list inside the top object): the
+                # encoder's indentation is additive, and string values never contain a
+                # raw "\n" (it is escaped), so prefixing every line is exact.
+                block = "    " + dumps_indented(system).replace("\n", "\n    ")
+            blocks[compact] = block
+            parts.append(block)
+        self._indented_blocks = blocks
+        head = (
+            "{\n"
+            f'  "format_version": {json.dumps(GALAXY_FORMAT_VERSION)},\n'
+            f'  "updated_at": {json.dumps(current_timestamp(), ensure_ascii=False)},\n'
+        )
+        if not parts:
+            return head + '  "systems": []\n}'
+        return head + '  "systems": [\n' + ",\n".join(parts) + "\n  ]\n}"
+
     def save(self) -> None:
         if self._write_blocked_reason:
             raise RuntimeError(self._write_blocked_reason)
         self.recalculate_galaxy_sectors()
-        payload = {
-            "format_version": GALAXY_FORMAT_VERSION,
-            "updated_at": current_timestamp(),
-            "systems": [asdict(s) for s in self.systems],
-        }
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
-        atomic_write_text(self.file_path, text)
+        text = self._galaxy_text()
+        self.data_version += 1
+        if text == self.last_written_text and self._is_own_file_unchanged():
+            # The file already holds exactly these bytes, written by this store.
+            return
+        written = atomic_write_text(self.file_path, text)
         self.last_written_text = text
+        self._own_file_identity = file_identity(written)
+
+    def _is_own_file_unchanged(self) -> bool:
+        """True when galaxy.json is still the very file this store last wrote or read (same
+        inode, device, size and modification time). Another writer always changes one of
+        them: the CLI bridge and other stores replace the file (new inode), an in-place
+        write changes the modification time."""
+        own = self._own_file_identity
+        return own is not None and _path_identity(self.file_path) == own
 
     def is_own_write(self) -> bool:
         """Checks if the file on disk matches the last content written by Helios itself."""
+        if self._is_own_file_unchanged():
+            return True
         try:
             return self.file_path.read_text(encoding="utf-8") == self.last_written_text
         except Exception:
@@ -1463,7 +1705,7 @@ class GalaxyStore:
             ),
             source="manual",
             source_id="helios-starter",
-            workspace_path=str(Path(__file__).resolve().parent.parent),
+            workspace_path=str(app_paths.source_dir() or ""),
         )
 
         p_arch = system.add_planet(

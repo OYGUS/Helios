@@ -1,0 +1,4 @@
+# Build-time only: turns Helios into Helios.exe (see helios.spec, build_exe.bat).
+# Not needed to run Helios from source.
+-r requirements.txt
+pyinstaller>=6.10,<7

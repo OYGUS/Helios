@@ -38,12 +38,14 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QEvent, QObject, QThread, Signal, Slot
 
-from connectors.agent_importer import AgentHistoryImporter
+from connectors.agent_importer import AgentDetector, AgentHistoryImporter
 from connectors.codebase_importer import CodebaseImporter
 from connectors.ollama_enhancer import OllamaEnhancer
+from core import paths as app_paths
 from core.models import GalaxyStore
 
-HELIOS_ROOT = Path(__file__).resolve().parent.parent
+# Helios's own source checkout to map; None in a frozen build (no source to analyze).
+HELIOS_ROOT = app_paths.source_dir()
 
 FinishedCallback = Callable[[bool, str, object], None]
 
@@ -154,7 +156,7 @@ class AgentSyncWorker(StoreWorker):
                 or 0
             )
 
-        if self.analyze_helios and not _has_helios_codebase(self.store):
+        if self.analyze_helios and self.helios_dir is not None and not _has_helios_codebase(self.store):
             self.progressText.emit("Analyzing the Helios codebase...")
             try:
                 payload["helios_system"] = CodebaseImporter.analyze_directory(self.helios_dir, self.store)
@@ -203,6 +205,22 @@ class CodebaseScanWorker(StoreWorker):
         return True, msg, {"mode": "projects", "projects_dir": projects_dir, "systems": systems}
 
 
+class MergeDuplicatesWorker(StoreWorker):
+    """Settings › "Merge duplicates": `GalaxyStore.merge_all_duplicates()` (undo snapshot,
+    merge, save) off the UI thread. Payload: ``{"projects": int, "nodes": int}``."""
+
+    failure_prefix = "Merging duplicates failed"
+
+    def work(self) -> tuple:
+        self.progressText.emit("Merging duplicate projects and modules...")
+        res = self.store.merge_all_duplicates()
+        if isinstance(res, tuple):
+            proj_count, mod_count = int(res[0]), int(res[1])
+        else:
+            proj_count, mod_count = 0, int(res)
+        return True, "Duplicates merged.", {"projects": proj_count, "nodes": mod_count}
+
+
 class ModelDetectWorker(QThread):
     """Resolves the preferred Ollama model off the UI thread (HTTP call + disk scan)."""
 
@@ -214,6 +232,73 @@ class ModelDetectWorker(QThread):
         except Exception:
             model = None
         self.detected.emit(model)
+
+
+class ToolDetectWorker(QThread):
+    """Runs `AgentDetector.detect_all()` (home-folder probes, PATH lookups and an HTTP
+    check of the Ollama API) off the UI thread. Emits ``detected(dict)`` once, or
+    ``detected(None)`` when detection failed. Does not touch the store."""
+
+    detected = Signal(object)  # Optional[Dict[str, Dict[str, object]]]
+
+    def run(self) -> None:
+        try:
+            tools = AgentDetector.detect_all()
+        except Exception:
+            tools = None
+        self.detected.emit(tools)
+
+
+class OllamaModelsWorker(QThread):
+    """Lists the installed Ollama models off the UI thread (disk scan + HTTP), and the
+    preferred model when `saved_model` is not one of them (what the Settings dialog
+    shows). Emits ``listed(models, preferred)`` once. Does not touch the store."""
+
+    listed = Signal(object, object)  # (List[str], Optional[str])
+
+    def __init__(self, saved_model: str = "", parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.saved_model = str(saved_model or "")
+
+    def run(self) -> None:
+        try:
+            models = list(OllamaEnhancer.detect_installed_models() or [])
+        except Exception:
+            models = []
+        preferred = None
+        saved = self.saved_model.lower()
+        if models and not (saved and any(m.lower() == saved for m in models)):
+            try:
+                preferred = OllamaEnhancer.get_preferred_model()
+            except Exception:
+                preferred = None
+        self.listed.emit(models, preferred)
+
+
+# Probe threads without a parent that outlives them (dialogs, views): kept here until they
+# finish, so closing a dialog never destroys a running QThread. The main window waits for
+# them on close (`wait_for_probe_workers`).
+_PROBE_WORKERS: "set[QThread]" = set()
+
+
+def start_probe_worker(worker: QThread) -> QThread:
+    """Starts a short read-only probe thread and keeps it alive until it has finished.
+
+    Finished threads are dropped on the next start (never from the thread's own
+    `finished` signal, which is emitted while the thread is still running)."""
+    for done in [w for w in _PROBE_WORKERS if w.isFinished()]:
+        _PROBE_WORKERS.discard(done)
+    _PROBE_WORKERS.add(worker)
+    worker.start()
+    return worker
+
+
+def wait_for_probe_workers(timeout_ms: int = 5000) -> bool:
+    """Waits (bounded) for running probe threads; True when none is left running."""
+    for worker in list(_PROBE_WORKERS):
+        if worker.isRunning():
+            worker.wait(timeout_ms)
+    return not any(w.isRunning() for w in list(_PROBE_WORKERS))
 
 
 class OllamaServerCheckWorker(QThread):

@@ -190,7 +190,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m connectors.live_bridge",
         description="Helios Live AI Agent & Codebase Bridge (Antigravity / Codex / Claude Code / Codebase)",
     )
-    parser.add_argument("--data", default=None, help="Path to a galaxy.json file (default: Helios data/galaxy.json)")
+    parser.add_argument("--data", default=None, help="Path to a galaxy.json file (default: data/galaxy.json in the Helios data folder, see core.paths)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sources = sorted(SOURCE_CATEGORIES.keys())
     layers = list(LAYER_DEFINITIONS.keys())

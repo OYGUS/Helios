@@ -8,7 +8,7 @@ description: Helios Architecture & Knowledge Graph integration. Lets an agent ad
 Use this skill when the user asks you to reflect a project into the **Helios** desktop application. Do not run it after every file change.
 
 ## Core Rules
-1. **Where to run:** from the Helios repository root, or add `--data PATH/to/galaxy.json` before the command. The bridge writes `data/galaxy.json`; the open app reloads it automatically.
+1. **Where to run:** from the Helios repository root, or add `--data PATH/to/galaxy.json` before the command. The bridge writes `data/galaxy.json` (or `data/` inside `HELIOS_DATA_DIR` when that is set); the open app reloads it automatically. The `Helios.exe` build keeps its data in `%APPDATA%\Helios\data\galaxy.json`: to update that app from a source checkout, pass `--data "%APPDATA%\Helios\data\galaxy.json"`.
 2. **Project Name (`--project`, required):** use the real project name (`Helios`, `MyProject`), never a chat sentence. Alias: `--system`.
 3. **Source (`--source`):** one of `antigravity` (default), `claude_code`, `codebase`, `codex`, `manual`. Pass it explicitly; an invalid value exits with code 2.
 4. **Layer (`--layer`):** one of `architecture`, `ui`, `core` (default), `integration`, `testing`, `research`, `docs`.
@@ -47,3 +47,6 @@ python -m connectors.live_bridge add-link --project "ProjectName" --source claud
 python -m connectors.live_bridge analyze-folder --path "./my-project"
 ```
 Modules are the project's top-level directories (one module per file for small projects); links come only from resolved imports/includes in Python, JS/TS, PHP and HTML references. Other languages get no links. Re-running it on the same directory refreshes the existing `codebase` project instead of duplicating it. The project purpose is only written from the project's own words (with Ollama, strong evidence only produces a "Suggested" sentence the user accepts, edits or dismisses); a descriptive README or a short header comment that says what the project is for (not license / encoding / lint lines) helps. It also writes the project's identity line (languages, kind, main libraries, entry point — derived from the code only), shown under the purpose.
+
+## In the app (for reference)
+After the bridge updates `galaxy.json`, the user can find the new modules and components with the search box (`Ctrl+F`, also matches function / class / file / library names already stored by the analysis), hide link kinds or modules with **Filter** (view only, nothing is saved), and export the project map as PNG or Markdown (project **…** menu or `Ctrl+E`). Links you add with `add-link` are shown there as "Added by hand", separate from links found in the code.

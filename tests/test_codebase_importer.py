@@ -416,7 +416,7 @@ def test_planet_cap_folds_into_other(tmp_path, store):
 
 
 def test_satellite_cap_mentions_hidden_files(tmp_path, store, monkeypatch):
-    monkeypatch.setattr(ci, "SATELLITE_CAP", 5)
+    monkeypatch.setattr("connectors.codebase.mapbuild.SATELLITE_CAP", 5)  # read by the directory map
     root = tmp_path / "big"
     write(root, "other/x.py", "")
     for i in range(6):
@@ -506,7 +506,7 @@ def test_tech_detection_exact_next_and_scoped_prefix(tmp_path):
 
 
 def test_pyproject_regex_fallback_without_tomllib(tmp_path, monkeypatch):
-    monkeypatch.setattr(ci, "_tomllib", None)
+    monkeypatch.setattr("connectors.codebase.libraries._tomllib", None)
     text = '[project]\ndescription = "next"\ndependencies = [\n  "flask>=2",\n]\n[tool.poetry.dependencies]\npython = "^3.10"\npandas = "*"\n'
     names = set(ci._pyproject_dependency_names(text))
     assert {"flask", "pandas"} <= names
@@ -573,7 +573,7 @@ def test_symlink_loop_is_not_followed(tmp_path, store):
 
 
 def test_large_files_counted_but_not_parsed(tmp_path, monkeypatch):
-    monkeypatch.setattr(ci, "MAX_PARSE_BYTES", 50)
+    monkeypatch.setattr("connectors.codebase.walk.MAX_PARSE_BYTES", 50)  # read by the walk
     root = tmp_path / "large"
     write(root, "big.py", "import os\n" * 20)
     files, skipped = ci._walk_project(root)
@@ -612,8 +612,11 @@ def test_scan_parent_collects_failures(tmp_path, store, monkeypatch):
 
 
 def test_no_blueprint_dependency():
-    src = Path(ci.__file__).read_text(encoding="utf-8")
-    assert "PROJECT_BLUEPRINTS" not in src
+    # The facade and every module of the package that implements it.
+    files = [Path(ci.__file__)] + sorted((Path(ci.__file__).parent / "codebase").glob("*.py"))
+    assert len(files) > 10
+    for path in files:
+        assert "PROJECT_BLUEPRINTS" not in path.read_text(encoding="utf-8"), path
 
 
 # ---------------------------------------------------------------------------
@@ -1022,15 +1025,18 @@ def test_rescan_idempotent_with_new_fields(tmp_path, store):
 
 def test_call_analysis_guards(tmp_path, monkeypatch):
     root = write_assistant_calls(tmp_path / "NOVA")
-    monkeypatch.setattr(ci, "CALL_ANALYSIS_MAX_FILE_BYTES", 200)
+    monkeypatch.setattr("connectors.codebase.walk.CALL_ANALYSIS_MAX_FILE_BYTES", 200)  # walk + core plan text
+    monkeypatch.setattr("connectors.codebase.mapbuild.CALL_ANALYSIS_MAX_FILE_BYTES", 200)
     system = SolarSystem(name="g")
     stats = build_code_map(root, system)
     assert sats(system)["asistan.py::baslat()"].calls == []
     assert "Call analysis skipped for 1 file larger than 0 KB" in stats.core_plan
     assert "Call analysis skipped: file is larger than 0 KB." in planet(system, "asistan.py").summary
     assert sats(system)["mikrofon.py::dinle_ve_yaz()"].calls == ["mikrofon.py::ses_kaydet()"]  # small file still analysed
-    monkeypatch.setattr(ci, "CALL_ANALYSIS_MAX_FILE_BYTES", 300_000)
-    monkeypatch.setattr(ci, "CALL_ANALYSIS_MAX_CODE_FILES", 3)
+    monkeypatch.setattr("connectors.codebase.walk.CALL_ANALYSIS_MAX_FILE_BYTES", 300_000)
+    monkeypatch.setattr("connectors.codebase.mapbuild.CALL_ANALYSIS_MAX_FILE_BYTES", 300_000)
+    monkeypatch.setattr("connectors.codebase.walk.CALL_ANALYSIS_MAX_CODE_FILES", 3)  # walk + core plan text
+    monkeypatch.setattr("connectors.codebase.mapbuild.CALL_ANALYSIS_MAX_CODE_FILES", 3)
     system = SolarSystem(name="g2")
     stats = build_code_map(root, system)
     assert stats.calls == 0 and not any(s.calls for s in sats(system).values())
@@ -1621,3 +1627,27 @@ def test_has_user_made_content_ignores_importer_only_kinds():
     s2.purpose_source = "user"
     assert ci.has_user_made_content(s2)
     assert ci.has_user_made_content(SolarSystem(name="m", source="manual"))
+
+
+def test_purpose_origin_records_readme_or_package(tmp_path, store):
+    root = tmp_path / "quillnote"
+    write(root, "README.md", "# quillnote\n\nQuillnote keeps a daily writing streak for poets and sends a reminder.\n")
+    write(root, "app.py", "x = 1\n")
+    system = CodebaseImporter.analyze_directory(root, store)
+    assert system.purpose_source == "readme" and system.purpose_origin == "readme"
+    # A package description appears later: the re-scan takes it and records the new origin.
+    write(root, "pyproject.toml", '[project]\nname = "quillnote"\ndescription = "Tracks a daily poetry streak."\n')
+    again = CodebaseImporter.analyze_directory(root, store)
+    assert again is system or again.id == system.id
+    refreshed = next(s for s in store.systems if s.id == system.id)
+    assert refreshed.purpose == "Tracks a daily poetry streak."
+    assert refreshed.purpose_source == "readme" and refreshed.purpose_origin == "package"
+
+
+def test_purpose_origin_is_package_for_manifest_description(tmp_path):
+    root = tmp_path / "bookit"
+    write(root, "composer.json", '{"description": "Booking system for a small campsite."}')
+    write(root, "index.php", "<?php echo 1;\n")
+    system = SolarSystem(name="bookit")
+    build_code_map(root, system)
+    assert system.purpose_source == "readme" and system.purpose_origin == "package"

@@ -1,0 +1,71 @@
+# Builds Helios.exe on Windows and publishes Helios-windows.zip.
+# Runs when a version tag is pushed (git tag v0.1.0 && git push --tags)
+# and can be started by hand from the Actions tab (Run workflow).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create the GitHub Release
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches the version in pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: python
+        run: |
+          import os, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              sys.exit(f"Tag {tag} does not match pyproject.toml version {version} (expected v{version}).")
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt -r requirements-build.txt
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+      - name: Build Helios.exe
+        run: python -m PyInstaller --noconfirm --clean helios.spec
+
+      - name: Check that Helios.exe starts
+        timeout-minutes: 5
+        env:
+          QT_QPA_PLATFORM: offscreen
+          HELIOS_DATA_DIR: ${{ runner.temp }}\helios-smoke
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Helios\Helios.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Helios.exe --smoke-test exited with code $($p.ExitCode)" }
+          if (-not (Test-Path "$env:HELIOS_DATA_DIR\data\galaxy.json")) { throw "Helios.exe did not create its data file" }
+
+      - name: Zip the build
+        shell: pwsh
+        run: Compress-Archive -Path "dist\Helios" -DestinationPath "Helios-windows.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Helios-windows
+          path: Helios-windows.zip
+
+      - name: Attach the zip to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Helios-windows.zip
+          generate_release_notes: true

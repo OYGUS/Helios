@@ -354,3 +354,48 @@ def test_purpose_prompt_asks_for_domain_words_no_hedging_and_unknown():
                    "answer exactly: UNKNOWN", "Write in Türkçe."):
         assert phrase in prompt, phrase
     assert len(oe.build_purpose_prompt("X" * 500, "evidence line\n" * 2000, "English")) <= oe.MAX_PURPOSE_PROMPT_CHARS
+
+
+# ----------------------------------------------------------------------
+# Short answers with one content word
+# ----------------------------------------------------------------------
+WEATHER_EV = ("README intro (README.md): Shows the weather forecast for your city every morning.\n"
+              "Names in code: getPort(), portfolioCache(), diceRoll()")
+
+
+@pytest.mark.parametrize("text,evidence,expected", [
+    ("A weather app.", WEATHER_EV, {"weather"}),
+    ("Weather app.", WEATHER_EV, {"weather"}),
+    ("A forecast tool.", WEATHER_EV, {"forecast"}),
+    ("A photos tool.", EV, {"photos"}),
+    ("A quiz app.", TR_EV, {"quiz"}),  # quiz ~ quizleri (strict: the same word plus a suffix)
+    ("Quiz uygulaması.", TR_EV, {"quiz"}),
+])
+def test_short_specific_answer_supported_by_own_words_passes(text, evidence, expected):
+    res = check_purpose_suggestion(text, evidence, "P")
+    assert res.ok, res
+    assert {m.split("~")[0].lower() for m in res.matched} == expected
+
+
+@pytest.mark.parametrize("text,evidence", [
+    ("A software project.", WEATHER_EV),
+    ("This is a tool that helps users.", WEATHER_EV),
+    ("A web app.", "README intro (README.md): A web page that shows the weather.\n"),  # platform word
+    ("A desktop application.", WEATHER_EV),
+    ("A school project.", "README intro (README.md): My school project about the weather.\n"),
+    ("Possibly a weather app.", WEATHER_EV),  # hedged
+    ("It might be a weather tool.", WEATHER_EV),
+    ("An app for weather.", WEATHER_EV),  # the word does not name the kind of thing
+    ("A project for photos.", EV),
+    ("A dice app.", WEATHER_EV),  # only in names in code, not in the project's own words
+    ("A portfolio website.", WEATHER_EV),  # only in names in code
+    ("A port tool.", "README intro (README.md): A portfolio of my drawings.\n"),  # shared prefix only
+    ("A chess app.", WEATHER_EV),  # unsupported
+    ("A quiz app.", "Capabilities implied by libraries: quiz engine (quizlib)\n"),  # not descriptive
+])
+def test_short_answer_vague_or_unsupported_still_generic(text, evidence):
+    assert _reason(text, evidence) == "generic"
+
+
+def test_short_answer_name_only_still_fails():
+    assert _reason("Skycast app.", WEATHER_EV, "Skycast") == "name_only"

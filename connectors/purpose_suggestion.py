@@ -22,6 +22,12 @@ Rules:
   empty purpose, strong evidence, no suggestion yet for the current evidence and no
   dismissal for it. An accepted "ai" purpose is therefore never re-suggested
   automatically.
+* A stored suggestion is shown (`pending_suggestion`) only while it is current: its
+  `purpose_suggestion_key` matches the current evidence. A suggestion made from evidence
+  that has changed since (stale) stays on disk but is not shown or accepted.
+* Without Ollama (turned off or no model found) no suggestion is shown anywhere: UI
+  callers pass `ai_available=False` and get "". The stored suggestion is kept, so it
+  comes back when Ollama is available again (if it is still current).
 * The core plan's `Purpose:` line only ever shows `purpose`; with only a suggestion it
   keeps saying "Not written yet".
 * `migrate_ai_purposes_to_suggestions` converts galaxy.json files written before
@@ -38,7 +44,7 @@ from connectors.purpose_evidence import assess_purpose_evidence, evidence_key
 from connectors.purpose_quality import REASONS, QualityResult, check_purpose_suggestion
 
 __all__ = (
-    "evidence_key", "current_evidence_key", "suggestion_allowed", "pending_suggestion",
+    "evidence_key", "current_evidence_key", "suggestion_allowed", "suggestion_is_current", "pending_suggestion",
     "check_suggestion_text", "set_purpose_suggestion", "accept_purpose_suggestion",
     "save_edited_purpose", "dismiss_purpose_suggestion", "needs_auto_suggestion",
     "manual_suggestion_allowed", "migrate_ai_purposes_to_suggestions", "classify_purpose_failure",
@@ -70,10 +76,23 @@ def suggestion_allowed(system: object) -> bool:
     return source == "ai" or not _text(getattr(system, "purpose", ""))
 
 
-def pending_suggestion(system: object) -> str:
-    """The suggestion to show (one line), or "" when there is none or it may not be shown."""
+def suggestion_is_current(system: object) -> bool:
+    """True if the stored suggestion was made from the project's current evidence (its
+    key matches); False for a stale suggestion or one without a key."""
+    key = str(getattr(system, "purpose_suggestion_key", "") or "")
+    return bool(key) and key == current_evidence_key(system)
+
+
+def pending_suggestion(system: object, ai_available: bool = True) -> str:
+    """The suggestion to show (one line), or "" when there is none or it may not be shown:
+    Ollama is unavailable (`ai_available=False`; UI callers always pass the app's state),
+    the purpose is protected, or the suggestion is stale for the current evidence."""
+    if not ai_available:
+        return ""
     text = _text(getattr(system, "purpose_suggestion", ""))
     if not text or not suggestion_allowed(system):
+        return ""
+    if not suggestion_is_current(system):
         return ""
     if text == _text(getattr(system, "purpose", "")):
         return ""

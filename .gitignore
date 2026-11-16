@@ -16,9 +16,11 @@ __pycache__/
 .venv/
 venv/
 env/
+.venv-build/
 build/
 dist/
 *.spec
+!helios.spec
 
 # IDE / OS settings
 .vscode/

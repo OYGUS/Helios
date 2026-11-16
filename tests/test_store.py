@@ -115,7 +115,8 @@ def test_empty_valid_file_is_not_an_error(tmp_path):
     store = _make_store(tmp_path)
     assert store.load_error is None
     assert store.backup_path is None
-    assert len(store.systems) == 1  # starter on first load
+    # changed: an empty valid file stays empty (the user removed every project).
+    assert store.systems == []
     assert sorted(p.name for p in tmp_path.iterdir()) == ["galaxy.json"]
 
 
@@ -175,3 +176,57 @@ def test_imported_projects_get_no_invented_links(tmp_path):
     links = {s.source: len(s.links) for s in reloaded.systems if s.name.startswith("p-")}
     assert links["manual"] > 0
     assert all(links[src] == 0 for src in ("codebase", "claude_code", "codex", "antigravity"))
+
+
+def test_empty_systems_file_stays_empty_on_first_load(tmp_path):
+    path = tmp_path / "galaxy.json"
+    path.write_text(json.dumps({"format_version": 2, "systems": []}), encoding="utf-8")
+    store = _make_store(tmp_path)
+    assert store.load_error is None
+    assert store.systems == []
+    # Loading again (a reload) and a fresh store both keep the empty state.
+    assert store.load() is True and store.systems == []
+    store.save()
+    again = _make_store(tmp_path)
+    assert again.systems == []
+    assert json.loads(path.read_text(encoding="utf-8"))["systems"] == []
+
+
+def test_removing_every_project_is_not_undone_by_restart(tmp_path):
+    store = _make_store(tmp_path)
+    assert len(store.systems) == 1  # starter project on the first ever run
+    store.systems.clear()
+    store.save()
+    restarted = _make_store(tmp_path)
+    assert restarted.systems == []
+    assert restarted.load_error is None
+
+
+def test_corrupt_file_still_falls_back_to_starter(tmp_path):
+    (tmp_path / "galaxy.json").write_text("{ not json", encoding="utf-8")
+    store = _make_store(tmp_path)
+    assert store.load_error
+    assert len(store.systems) == 1
+
+
+def test_undo_back_to_empty_store(tmp_path):
+    path = tmp_path / "galaxy.json"
+    path.write_text(json.dumps({"format_version": 2, "systems": []}), encoding="utf-8")
+    store = _make_store(tmp_path)
+    store.push_undo()
+    _add_project(store, "Orbit")
+    assert len(store.systems) == 1
+    assert store.undo() is True
+    assert store.systems == []
+
+
+def test_old_file_without_purpose_origin_loads(tmp_path):
+    path = tmp_path / "galaxy.json"
+    path.write_text(json.dumps({"format_version": 2, "systems": [
+        {"name": "Lantern", "purpose": "Lights a garden path.", "purpose_source": "readme"}]}), encoding="utf-8")
+    store = _make_store(tmp_path)
+    assert store.systems[0].purpose_source == "readme"
+    assert store.systems[0].purpose_origin == ""
+    store.systems[0].purpose_origin = "package"
+    store.save()
+    assert _make_store(tmp_path).systems[0].purpose_origin == "package"

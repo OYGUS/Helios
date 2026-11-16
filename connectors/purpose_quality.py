@@ -25,9 +25,23 @@ generic        fewer than `MIN_CONTENT_WORDS` meaningful words are left once tem
                words, the generic vocabulary (`GENERIC_WORDS`), hedges (`HEDGE_WORDS`),
                words that only talk about the evidence (`META_WORDS`) and stopwords are
                removed ("A software project that helps users manage data.", "Based on the
-               evidence, this is an application.")
+               evidence, this is an application."), unless the answer is a short but
+               specific one (see "One content word" below)
 no_overlap     no content word of the answer matches a content word of the evidence
 =============  ==============================================================================
+
+One content word: a short answer such as "A weather app." or "Quiz uygulaması." has a
+single meaningful word. It passes only when all of these hold (`_single_word_ok`): the
+word directly names the kind of thing (it is followed by a kind noun such as app, tool,
+website, uygulaması: `KIND_WORDS`); it is not a platform / shape / setting word that
+says nothing about the purpose ("A web app.", "A desktop tool.", "A school project.":
+`SHAPE_WORDS`); the answer has no hedge ("Possibly a weather app."); and the word
+matches, strictly (`strict_words_match`: the same word or the same word plus a short
+suffix, not just a shared 4-letter prefix), a word of the project's own descriptive
+evidence (description, README intro / title, docstrings, header comments, titles shown
+to users, command-line help, session requests: `DESCRIPTIVE_LABELS`), not only names in
+code or libraries. A wrong purpose is worse than an empty one, so every other answer with
+one content word stays "generic".
 
 Word matching (`words_match`) uses `purpose_evidence.word_key` (Turkish-aware lower
 case: I -> ı, İ -> i, accents and ı ş ç ğ ö ü folded to ASCII) and is lenient: two words
@@ -116,6 +130,24 @@ python javascript typescript php java html css react node nodejs shell powershel
 meta description heading title window
 """
 _EXTRA_STOP_RAW = "does did doing its it's which that what who whose whom been being into onto"
+#: Generic nouns naming the kind of thing; in "<word> app" the <word> is the topic.
+_KIND_RAW = """
+project app application program programme tool website platform service library framework script
+system module solution interface
+proje projesi uygulama uygulaması uygulamasi programı programi araç araci aracı sistem sistemi yazılım
+yazilim yazılımı yazilimi
+"""
+#: Platform / shape / setting words: never enough on their own to say what a project is for.
+_SHAPE_RAW = """
+web online offline desktop mobile android ios iphone windows linux macos mac browser cli console terminal
+command line gui local personal private custom open source free static dynamic frontend backend server
+client api rest full stack cross new modern lightweight fast little tiny simple basic first test testing
+demo sample example starter template prototype experimental experiment toy hobby school homework
+assignment class course student university college practice learning tutorial beginner final side
+internal company business official main core
+masaüstü masaustu mobil çevrimiçi cevrimici kişisel kisisel basit küçük kucuk ödev odev okul ders deneme
+örnek ornek ilk yeni
+"""
 
 
 def _keys(raw: str) -> Set[str]:
@@ -129,6 +161,8 @@ TEMPLATE_WORDS: Set[str] = _keys(_TEMPLATE_RAW)
 BOILERPLATE_WORDS: Set[str] = _keys(_BOILERPLATE_RAW)
 _EXTRA_STOP: Set[str] = _keys(_EXTRA_STOP_RAW)
 _NOT_CONTENT: Set[str] = GENERIC_WORDS | HEDGE_WORDS | META_WORDS | TEMPLATE_WORDS | _EXTRA_STOP
+KIND_WORDS: Set[str] = _keys(_KIND_RAW)
+SHAPE_WORDS: Set[str] = _keys(_SHAPE_RAW)
 
 
 def _is_in(key: str, words: Set[str]) -> bool:
@@ -287,6 +321,43 @@ def evidence_words(evidence: str, project_name: str = "") -> List[Tuple[str, str
                           GENERIC_WORDS | BOILERPLATE_WORDS, split_identifiers=True)
 
 
+#: Evidence lines in the project's own descriptive words (a one-word answer must match one).
+DESCRIPTIVE_LABELS: Tuple[str, ...] = (
+    SESSION_EVIDENCE_LABEL,
+    "Own description",
+    "README intro",
+    "README title",
+    "Docstring",
+    "Header comment",
+    "Titles shown to users",
+    "Command-line help",
+)
+
+
+def descriptive_evidence(evidence: str) -> str:
+    """Only the evidence lines whose label is one of `DESCRIPTIVE_LABELS`."""
+    out: List[str] = []
+    for raw in (evidence or "").splitlines():
+        line = raw.strip()
+        m = _LABEL_RE.match(line)
+        if m and line[: m.end()].split("(")[0].strip(" :") in DESCRIPTIVE_LABELS:
+            out.append(line)
+    return "\n".join(out)
+
+
+def strict_words_match(a: str, b: str) -> bool:
+    """Stricter than `words_match`: the same word (doubled letters counted once), or a word
+    of 4+ letters plus a suffix of at most 4 letters ("quiz" ~ "quizzes" / "quizleri",
+    "photo" ~ "photos"); a shared prefix alone ("port" ~ "portfolio") is not enough."""
+    if not a or not b:
+        return False
+    a, b = _squeeze(a), _squeeze(b)
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return len(short) >= PREFIX_MATCH_LEN and long_.startswith(short) and len(long_) - len(short) <= 4
+
+
 # ---------------------------------------------------------------------------
 # Answer side
 # ---------------------------------------------------------------------------
@@ -345,6 +416,23 @@ def _fail(reason: str) -> QualityResult:
     return QualityResult(ok=False, reason=reason, detail=REASONS[reason])
 
 
+def _single_word_ok(word: str, key: str, body: str, evidence: str, project_name: str) -> Tuple[str, ...]:
+    """The "One content word" rule of the module docstring: ("answer~evidence",) when the
+    one-word answer may pass, else ()."""
+    if _is_in(key, SHAPE_WORDS):
+        return ()
+    tokens = [word_key(t) for t in re.findall(r"[^\W\d_]+", _APOSTROPHE_SUFFIX_RE.sub("", body))]
+    if any(_is_in(t, HEDGE_WORDS) for t in tokens):
+        return ()
+    if not any(t == key and i + 1 < len(tokens) and _is_in(tokens[i + 1], KIND_WORDS)
+               for i, t in enumerate(tokens)):
+        return ()
+    for ev_word, ev_key in evidence_words(descriptive_evidence(evidence), project_name):
+        if strict_words_match(key, ev_key):
+            return (f"{word}~{ev_word}",)
+    return ()
+
+
 def check_purpose_suggestion(text: str, evidence: str, project_name: str) -> QualityResult:
     """Accepts or rejects a model-written purpose (see the module docstring for the rules)."""
     plain = _plain(text)
@@ -361,7 +449,8 @@ def check_purpose_suggestion(text: str, evidence: str, project_name: str) -> Qua
         mentions_name = any(_is_name(word_key(w), names) for w in re.findall(r"[^\W\d_]+", _APOSTROPHE_SUFFIX_RE.sub("", body)))
         return _fail("name_only" if mentions_name else "generic")
     if len(content) < MIN_CONTENT_WORDS:
-        return _fail("generic")
+        single = _single_word_ok(*content[0], body, evidence, project_name) if len(content) == 1 else ()
+        return QualityResult(ok=True, matched=single) if single else _fail("generic")
     ev = evidence_words(evidence, project_name)
     matched: List[str] = []
     for word, key in content:
@@ -377,4 +466,5 @@ __all__: Sequence[str] = (
     "QualityResult", "REASONS", "check_purpose_suggestion", "count_sentences", "evidence_text",
     "evidence_words", "is_unknown", "name_keys", "words_match", "GENERIC_WORDS", "HEDGE_WORDS",
     "META_WORDS", "BOILERPLATE_WORDS", "EVIDENCE_LABELS", "MAX_CHARS", "MAX_SENTENCES",
+    "KIND_WORDS", "SHAPE_WORDS", "DESCRIPTIVE_LABELS", "descriptive_evidence", "strict_words_match",
 )
