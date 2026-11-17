@@ -47,7 +47,8 @@ from PySide6.QtWidgets import (
 from connectors import codebase_importer as codebase_importer_module
 from core.models import SolarSystem, get_source_meta
 from ui import theme
-from ui.inspector import ClampedLabel, ElidedLabel, PurposeEditor, chip, clear_layout
+from ui.flow_layout import FlowLayout, flow_row
+from ui.inspector import ClampedLabel, ElidedButton, ElidedLabel, PurposeEditor, chip, clear_layout
 
 
 class ProjectHeaderMixin:
@@ -84,7 +85,7 @@ class ProjectHeaderMixin:
         self.project_chips_layout.setSpacing(6)
         lay.addWidget(self.project_chips_widget)
 
-        self.lbl_project_counts = theme.label("", "caption")
+        self.lbl_project_counts = theme.label("", "caption", wrap=True)
         lay.addWidget(self.lbl_project_counts)
 
         # Counterparts of the same project from other sources.
@@ -96,9 +97,8 @@ class ProjectHeaderMixin:
         self.related_sources_widget.setVisible(False)
         lay.addWidget(self.related_sources_widget)
 
-        actions = QHBoxLayout()
-        actions.setContentsMargins(-6, 2, 0, 0)
-        actions.setSpacing(2)
+        # Wraps onto a second line instead of widening the panel (large fonts).
+        actions = flow_row(spacing=2, margins=(-6, 2, 0, 0))
         self.btn_ollama_single = QPushButton(self._ollama_button_label())
         self.btn_ollama_single.setObjectName("OllamaBtn")
         self.btn_ollama_single.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -117,7 +117,6 @@ class ProjectHeaderMixin:
         self.btn_copy_prompt.setToolTip("Copy the project overview, modules and links as a prompt for an AI assistant")
         self.btn_copy_prompt.clicked.connect(lambda: self._copy_project_as_prompt(self.canvas.active_system))
         actions.addWidget(self.btn_copy_prompt)
-        actions.addStretch(1)
         lay.addLayout(actions)
         side_layout.addWidget(self.sun_card)
 
@@ -188,9 +187,7 @@ class ProjectHeaderMixin:
         self.lbl_suggestion.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_suggestion.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         sb.addWidget(self.lbl_suggestion)
-        sb_actions = QHBoxLayout()
-        sb_actions.setContentsMargins(0, 2, 0, 0)
-        sb_actions.setSpacing(4)
+        sb_actions = flow_row(spacing=4, margins=(0, 2, 0, 0))
         self.btn_suggestion_accept = QPushButton("Accept")
         self.btn_suggestion_edit = QPushButton("Edit")
         self.btn_suggestion_dismiss = QPushButton("Dismiss")
@@ -205,7 +202,6 @@ class ProjectHeaderMixin:
             btn.setToolTip(tip)
             btn.clicked.connect(lambda checked=False, f=slot: f())
             sb_actions.addWidget(btn)
-        sb_actions.addStretch(1)
         sb.addLayout(sb_actions)
         self.suggestion_box.setVisible(False)
         lay.addWidget(self.suggestion_box)
@@ -213,10 +209,9 @@ class ProjectHeaderMixin:
         # Neither a purpose nor a suggestion: one muted line that opens the editor.
         self.purpose_empty = QWidget()
         self.purpose_empty.setObjectName("Transparent")
-        pe = QHBoxLayout(self.purpose_empty)
+        pe = FlowLayout(self.purpose_empty, h_spacing=12, v_spacing=4)
         pe.setContentsMargins(0, 0, 0, 2)
-        pe.setSpacing(12)
-        self.btn_purpose_add = QPushButton("Add what this project is for")
+        self.btn_purpose_add = ElidedButton("Add what this project is for")
         self.btn_purpose_add.setObjectName("PurposeAddBtn")
         self.btn_purpose_add.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_purpose_add.setToolTip("Describe in a sentence or two what this project is for")
@@ -228,7 +223,6 @@ class ProjectHeaderMixin:
         self.btn_suggest_ai.clicked.connect(lambda checked=False: self._suggest_purpose_with_ai(self.canvas.active_system))
         self.btn_suggest_ai.setVisible(False)
         pe.addWidget(self.btn_suggest_ai)
-        pe.addStretch(1)
         lay.addWidget(self.purpose_empty)
 
         self.purpose_edit_box = QWidget()
@@ -255,8 +249,11 @@ class ProjectHeaderMixin:
         self.btn_purpose_cancel.setToolTip("Cancel (Esc)")
         self.btn_purpose_cancel.clicked.connect(lambda checked=False: self._cancel_purpose_edit())
         ed_row.addWidget(self.btn_purpose_cancel)
-        ed_row.addStretch(1)
-        ed_row.addWidget(theme.label("Ctrl+Enter saves · Esc cancels", "muted"))
+        # Takes the free space, right-aligned; elided (full text in its tooltip) so a large font never widens the panel.
+        keys_hint = ElidedLabel("Ctrl+Enter saves · Esc cancels")
+        theme.set_role(keys_hint, "muted")
+        keys_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ed_row.addWidget(keys_hint, 1)
         ed.addLayout(ed_row)
         self.purpose_edit_box.setVisible(False)
         lay.addWidget(self.purpose_edit_box)

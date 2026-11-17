@@ -249,8 +249,24 @@ def _toml_section_keys(text: str, section_re: str) -> List[str]:
 def _toml_array_strings(text: str, key: str) -> List[str]:
     """Regex fallback: string items of `key = [ ... ]` arrays (multi-line)."""
     out: List[str] = []
-    for m in re.finditer(rf"(?m)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]", text, flags=re.DOTALL):
-        out.extend(re.findall(r"[\"']([^\"']+)[\"']", m.group(1)))
+    for m in re.finditer(rf"(?m)^\s*{re.escape(key)}\s*=\s*\[", text):
+        # Strings are read up to the array's own closing bracket: a `]` inside a string
+        # (extras such as "fastapi[all]") does not end the array. `#` comments are skipped.
+        i, n = m.end(), len(text)
+        while i < n and text[i] != "]":
+            ch = text[i]
+            if ch in "\"'":
+                end = text.find(ch, i + 1)
+                if end < 0:
+                    break
+                if end > i + 1:
+                    out.append(text[i + 1 : end])
+                i = end + 1
+            elif ch == "#":
+                nl = text.find("\n", i)
+                i = n if nl < 0 else nl + 1
+            else:
+                i += 1
     return out
 
 

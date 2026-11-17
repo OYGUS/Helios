@@ -21,6 +21,7 @@ Windows is the primary target; Linux runs headless in CI.
 - `ui/space_canvas.py` — facade of the QGraphicsScene canvas; the code is in `ui/canvas/` (one module per graphics item, `view.py` = `SpaceCanvasView`, its behaviour in `view_*` mixins; module map in the facade docstring).
 - `ui/theme.py` — the only place for colours, spacing, fonts and the stylesheet (no inline colour literals elsewhere). `ui/inspector.py` — right-panel rendering helpers.
 - `ui/workers.py` — `QThread` workers for long scans, read-only probe threads (`start_probe_worker`) and the canvas paint freezer.
+- `ui/overflow_row.py` — `OverflowRow`, the top bar's action buttons: the ones that do not fit move into a "More" menu instead of widening the window (Helios must fit 1366x768 with any font). `ui/flow_layout.py` — `FlowLayout`, a wrapping button row (header rows wrap instead of widening the right panel).
 - `ui/welcome.py` — `WelcomePanel`, shown on the canvas while the store has no projects (the ways to add a first project; actions go through `contextActionRequested`).
 - `ui/search.py` — `SearchController` (debounced typing, results list under the search field, Up/Down/Enter/Esc); `core/search_index.py` — the pure `SearchIndex` over stored data only (names, the analysis-owned `defined_names` lists — old data falls back to the clipped `Defines:` line —, `Files (N):` lists, packages).
 - `ui/filters.py` — `MapFilter` (view state only: link kinds, external libraries, Work History, layers), `FilterPopover`, `FilterBanner`; hidden items are `setVisible(False)`, layout unchanged.

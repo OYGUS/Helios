@@ -1757,6 +1757,20 @@ def test_purpose_run_with_the_real_ollama_worker(env, monkeypatch):
     assert opener.count == 1, "one request per eligible project"
 
 
+def _card_line_shows(shown: str, full: str, font) -> bool:
+    """A one-line card text is the full text when it fits the card, else its elided start.
+
+    Font-independent: CI machines (and users) have wider fonts than the dev container, so
+    the exact cut-off point is not fixed; the full text is always in the card's tooltip.
+    """
+    from ui.canvas.overview_items import GalaxyClusterItem
+
+    room = GalaxyClusterItem.CARD_W - 32.0
+    if QtGui.QFontMetricsF(font).horizontalAdvance(full) <= room:
+        return shown == full
+    return shown.endswith("…") and len(shown) > 1 and full.startswith(shown[:-1])
+
+
 def test_identity_line_in_header_cards_tooltips_and_search(env):
     from connectors.codebase_importer import IDENTITY_TOOLTIP
 
@@ -1785,8 +1799,16 @@ def test_identity_line_in_header_cards_tooltips_and_search(env):
     # Cards: both projects show it (the second one derived), tooltips too.
     win.canvas.switch_to_galaxy_view()
     cards = {c.system.id: c for c in win.canvas.galaxy_items}
-    assert cards[system.id].identity_text().startswith("Python · faster_whisper")
-    assert cards[other.id].identity_text() == "JavaScript web server · express · entry: server.js"
+    from ui import theme as ui_theme
+
+    id_font = ui_theme.font(ui_theme.IDENTITY_FS)
+    assert cards[system.id].identity_text().startswith("Python · ")
+    assert _card_line_shows(cards[system.id].identity_text(), system.identity, id_font)
+    assert system.identity in cards[system.id].toolTip()  # the full line, however wide the font
+    derived = "JavaScript web server · express · entry: server.js"
+    assert cards[other.id]._identity_snippet == derived
+    assert _card_line_shows(cards[other.id].identity_text(), derived, id_font)
+    assert derived in cards[other.id].toolTip()
     assert other.identity == ""  # display-only derivation, nothing written
     assert "derived from the code analysis" in cards[other.id].toolTip()
     win.canvas.viewport().grab()  # paints without errors
@@ -1966,7 +1988,13 @@ def test_cards_show_suggestion_as_muted_suggested_line(env):
     cards = {c.system.id: c for c in win.canvas.galaxy_items}
     card = cards[system.id]
     assert card.description_lines() == [] and card._purpose_snippet == ""
-    assert card.suggestion_text().startswith("Suggested: A local voice")
+    from ui import theme as ui_theme
+
+    s_font = ui_theme.font(ui_theme.FS_SMALL)
+    s_font.setItalic(True)
+    assert card.suggestion_text().startswith("Suggested: A local")
+    assert _card_line_shows(card.suggestion_text(), f"Suggested: {system.purpose_suggestion}", s_font)
+    assert system.purpose_suggestion in card.toolTip()  # full text, however wide the font
     assert "Suggested (not accepted yet):" in card.toolTip()
     assert cards[other.id].suggestion_text() == ""
     win.canvas.viewport().grab()

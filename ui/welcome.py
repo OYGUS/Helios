@@ -18,7 +18,16 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QBoxLayout, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QBoxLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 from core import paths as app_paths
 from ui import theme
@@ -77,6 +86,8 @@ class _Step(QFrame):
         self.box.setDirection(QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight)
         self.box.setSpacing(theme.SPACE_S if narrow else theme.SPACE_M)
         self._button_layout.setContentsMargins(22 + theme.SPACE_S if narrow else 0, 0, 0, 0)
+        self.box.invalidate()
+        self.updateGeometry()
 
 
 class WelcomePanel(QFrame):
@@ -86,7 +97,21 @@ class WelcomePanel(QFrame):
         super().__init__(parent)
         self.setObjectName("WelcomePanel")
         self._run_action = run_action
-        lay = QVBoxLayout(self)
+        # The content scrolls when the canvas is too short for it (a small window or large
+        # fonts); otherwise the scroll area is invisible and the panel is exactly its content.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.content = QWidget()
+        self.content.setObjectName("Transparent")
+        self.scroll.setWidget(self.content)
+        outer.addWidget(self.scroll)
+        lay = QVBoxLayout(self.content)
         lay.setContentsMargins(theme.SPACE_XL, theme.SPACE_XL - 4, theme.SPACE_XL, theme.SPACE_L)
         lay.setSpacing(theme.SPACE_S)
 
@@ -160,16 +185,40 @@ class WelcomePanel(QFrame):
             step.set_narrow(narrow)
 
     def place(self, area_w: int, area_h: int, left_reserved: int = 0) -> None:
-        """Sizes the panel for the canvas viewport and centres it."""
+        """Sizes the panel for the canvas viewport and centres it.
+
+        The panel is as tall as its content; when the viewport is shorter than that it is
+        capped to the viewport and its content scrolls (never cut off, never outside).
+        """
         avail = max(260, area_w - left_reserved - 2 * theme.SPACE_L)
         width = min(560, avail)
-        self.set_narrow(width < NARROW_WIDTH)
         self.setFixedWidth(width)
+        # Stack the buttons under their text on a narrow canvas, and also when the side-by-side
+        # rows need more width than there is (large fonts).
+        self.set_narrow(False)
+        self.content.layout().invalidate()
+        cr = self.contentsRect()
+        side_by_side_w = self.content.layout().totalMinimumSize().width()
+        self.set_narrow(width < NARROW_WIDTH or side_by_side_w > cr.width())
         self.setMinimumHeight(0)
-        self.adjustSize()
-        h = self.heightForWidth(width) if self.hasHeightForWidth() else self.sizeHint().height()
-        h = max(h, self.minimumSizeHint().height())
-        self.resize(width, h)
+        # The styled border sits outside the layout: count it like the layout's own margins.
+        cr = self.contentsRect()
+        frame_w = self.width() - cr.width()
+        frame_h = self.height() - cr.height()
+        inner_w = width - frame_w
+        lay = self.content.layout()
+        if lay.hasHeightForWidth():
+            content_h = lay.totalHeightForWidth(inner_w)
+        else:
+            content_h = lay.totalSizeHint().height()
+        h = content_h + frame_h
+        room = max(0, area_h - 2 * theme.SPACE_L)
+        if h > room:
+            h = max(min(h, 160), room)
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFixedHeight(h)
         x = left_reserved + max(theme.SPACE_L, (area_w - left_reserved - width) // 2)
         y = max(theme.SPACE_L, (area_h - h) // 2)
         self.move(x, y)

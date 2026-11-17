@@ -19,7 +19,7 @@ import html
 import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QFontMetricsF, QKeyEvent, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QDialog,
@@ -423,6 +423,61 @@ class ElidedLabel(QLabel):
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
         if event.type() in (event.Type.FontChange, event.Type.StyleChange):
+            self._refresh()
+
+
+class ElidedButton(QPushButton):
+    """Flat text button that elides its text when it is given less width than it needs.
+
+    ``text()`` returns the full text; ``sizeHint()`` is the width of the full text, so a
+    layout shows it in full whenever there is room (it only elides on a narrow panel or
+    with a large font).
+    """
+
+    MIN_WIDTH = 48
+
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self._full = str(text or "")
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt API)
+        self._full = str(text or "")
+        super().setText(self._full)
+        self._refresh()
+
+    def text(self) -> str:  # noqa: D401
+        return self._full
+
+    def _extra_width(self) -> int:
+        """Width of the shown text in excess of the full text (<= 0 while elided)."""
+        fm = self.fontMetrics()
+        return fm.horizontalAdvance(self._full) - fm.horizontalAdvance(super().text())
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt API)
+        hint = super().sizeHint()
+        return QSize(hint.width() + self._extra_width(), hint.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt API)
+        hint = self.sizeHint()
+        return QSize(min(hint.width(), self.MIN_WIDTH), super().minimumSizeHint().height())
+
+    def _refresh(self) -> None:
+        fm = self.fontMetrics()
+        full_w = fm.horizontalAdvance(self._full)
+        room = self.width() - max(0, self.sizeHint().width() - full_w)
+        # Compared in the same integer metric as sizeHint: at its hint width the text is whole
+        # (elidedText alone works in fractional pixels and may cut the last letter).
+        shown = self._full if room >= full_w else fm.elidedText(self._full, Qt.TextElideMode.ElideRight, max(10, room))
+        if shown != super().text():
+            super().setText(shown)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        self._refresh()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
             self._refresh()
 
 

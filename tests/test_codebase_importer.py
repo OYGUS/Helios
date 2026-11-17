@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import textwrap
 from collections import Counter
 from pathlib import Path
@@ -660,7 +661,12 @@ def test_analyze_updates_agent_system_for_same_folder(tmp_path, store):
 
 def test_windows_style_paths_match_case_insensitively():
     assert ci.workspace_key(r"C:\Users\X\Desktop\GuildKeeper\\") == ci.workspace_key(r"c:\users\x\desktop\guildkeeper")
-    assert ci.workspace_key("/home/a/Proj") != ci.workspace_key("/home/a/proj")
+    # POSIX-style paths keep their case where the filesystem is case-sensitive; on Windows
+    # (case-insensitive NTFS) they are case-folded like Windows paths (see `workspace_key`).
+    if os.name == "nt":
+        assert ci.workspace_key("/home/a/Proj") == ci.workspace_key("/home/a/proj")
+    else:
+        assert ci.workspace_key("/home/a/Proj") != ci.workspace_key("/home/a/proj")
 
 
 def test_rescan_keeps_ai_summary_and_user_planet(tmp_path, store):
@@ -1025,8 +1031,10 @@ def test_rescan_idempotent_with_new_fields(tmp_path, store):
 
 def test_call_analysis_guards(tmp_path, monkeypatch):
     root = write_assistant_calls(tmp_path / "NOVA")
-    monkeypatch.setattr("connectors.codebase.walk.CALL_ANALYSIS_MAX_FILE_BYTES", 200)  # walk + core plan text
-    monkeypatch.setattr("connectors.codebase.mapbuild.CALL_ANALYSIS_MAX_FILE_BYTES", 200)
+    # 300 bytes: only asistan.py (~440 bytes) is larger; islemler.py is ~200 bytes with LF and
+    # ~210 with CRLF (write_text on Windows), so the limit must not sit between the two.
+    monkeypatch.setattr("connectors.codebase.walk.CALL_ANALYSIS_MAX_FILE_BYTES", 300)  # walk + core plan text
+    monkeypatch.setattr("connectors.codebase.mapbuild.CALL_ANALYSIS_MAX_FILE_BYTES", 300)
     system = SolarSystem(name="g")
     stats = build_code_map(root, system)
     assert sats(system)["asistan.py::baslat()"].calls == []

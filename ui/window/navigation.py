@@ -12,7 +12,7 @@ Window attributes it relies on (created in `HeliosMainWindow.__init__` or
     _selected_node, _selected_type, _store_busy, btn_bc_galaxy, btn_bc_project,
     btn_filter, btn_show_details, btn_toggle_orbit, canvas, central_stack,
     filter_popover, lbl_bc_sep1, lbl_bc_sep2, lbl_breadcrumb, status_label, store,
-    tour_card, tour_status_label
+    top_actions, tour_card, tour_status_label
 Of those, assigned by this mixin:
     _selected_node, _selected_type
 """
@@ -233,7 +233,7 @@ class NavigationMixin:
     def _open_filter_popover(self) -> None:
         if self.canvas.view_mode != "system" or self.canvas.active_system is None:
             return
-        self.filter_popover.open_below(self.btn_filter)
+        self.filter_popover.open_below(self.top_actions.anchor_for(self.btn_filter))
 
     def _on_map_filter_changed(self, status: str) -> None:
         flt = self.canvas.map_filter

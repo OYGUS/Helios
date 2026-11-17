@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QBrush, QFont  # noqa: E402
 from PySide6.QtWidgets import QTreeWidgetItem  # noqa: E402
 
-from core.models import SolarSystem, get_source_meta  # noqa: E402
+from core.models import GalaxyStore, SolarSystem, get_source_meta  # noqa: E402
 from ui import theme  # noqa: E402
 from ui.window.project_text import _project_search_text  # noqa: E402
 
@@ -193,7 +193,11 @@ def _fill(store) -> None:
 
 
 def _window(env, reference: bool):
-    win = env["make_window"](onboarded=True)
+    # Each window has its own galaxy.json: with one shared file, a save in one window is an
+    # external change for the other, whose file watcher reloads it (it does on Windows), and
+    # the two trees would then be compared after different code paths.
+    folder = env["tmp"] / ("reference" if reference else "new")
+    win = env["make_window"](store=GalaxyStore(storage_path=folder / "galaxy.json"), onboarded=True)
     win.store.set_setting("connected_sources", [])
     _fill(win.store)
     if reference:

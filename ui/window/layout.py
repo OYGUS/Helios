@@ -16,7 +16,7 @@ Window attributes it relies on (created in `HeliosMainWindow.__init__` or
     btn_view_mode, busy_bar, canvas, central_stack, connections_view, filter_popover,
     hierarchy_tree, lbl_bc_sep1, lbl_bc_sep2, lbl_breadcrumb, lbl_ollama_status,
     lbl_skipped_link, main_splitter, search_ctl, search_input, status_bar, status_label,
-    store, tree_filter, tree_group_mode
+    store, top_actions, tree_filter, tree_group_mode
 Of those, assigned by this mixin:
     _busy_lock_widgets, _splitter_save_timer, btn_add_project, btn_bc_galaxy,
     btn_bc_project, btn_connections, btn_filter, btn_fit_view, btn_group_by_project,
@@ -24,7 +24,7 @@ Of those, assigned by this mixin:
     btn_sync_agents, btn_toggle_orbit, btn_tour, btn_view_mode, busy_bar, canvas,
     central_stack, connections_view, filter_popover, hierarchy_tree, lbl_bc_sep1,
     lbl_bc_sep2, lbl_breadcrumb, lbl_ollama_status, lbl_skipped_link, main_splitter,
-    search_ctl, search_input, status_bar, status_label, tree_filter, tree_group_mode
+    search_ctl, search_input, status_bar, status_label, top_actions, tree_filter, tree_group_mode
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ from connectors import codebase_importer as codebase_importer_module
 from ui import theme
 from ui.filters import FilterPopover
 from ui.inspector import ElidedLabel
+from ui.overflow_row import OverflowRow
 from ui.search import SearchController
 from ui.space_canvas import SpaceCanvasView
 from ui.window.integrations import AIConnectionsView
@@ -122,38 +123,50 @@ class LayoutMixin:
         top_layout.addWidget(self.search_input, stretch=3)
         top_layout.addSpacing(10)
 
-        def top_button(text: str, tip: str, checkable: bool = False) -> QPushButton:
+        # The action buttons live in an OverflowRow: on a narrow window (or with wide fonts)
+        # the least important ones move into its "More" menu instead of widening the window.
+        self.top_actions = OverflowRow(top_bar, spacing=4)
+
+        def top_button(text: str, tip: str, checkable: bool = False, priority: int = 0) -> QPushButton:
             btn = QPushButton(text)
             btn.setObjectName("QuietBtn")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(tip)
             btn.setCheckable(checkable)
-            top_layout.addWidget(btn)
+            self.top_actions.add_button(btn, priority)
             return btn
 
-        self.btn_toggle_orbit = top_button("Motion", "Let the modules orbit slowly (off by default)", True)
+        # Priorities: lower values move into "More" first.
+        self.btn_toggle_orbit = top_button("Motion", "Let the modules orbit slowly (off by default)", True, 0)
         self.btn_toggle_orbit.clicked.connect(self._toggle_orbit_motion)
-        self.btn_fit_view = top_button("Fit view", "Fit the whole map into the window  (F, Ctrl+0)")
+        self.btn_fit_view = top_button("Fit view", "Fit the whole map into the window  (F, Ctrl+0)", priority=2)
         self.btn_fit_view.clicked.connect(lambda: self.canvas.fit_to_view())
         self.btn_show_details = top_button(
-            "Show all details", "Always show every module's components, not only for the selected one", True
+            "Show all details", "Always show every module's components, not only for the selected one", True, 1
         )
         self.btn_show_details.setChecked(self.canvas_show_all_details_setting())
         self.btn_show_details.clicked.connect(self._toggle_show_all_details)
-        self.btn_filter = top_button("Filter", "Choose which links and modules the map shows (only the view changes)")
+        self.btn_filter = top_button("Filter", "Choose which links and modules the map shows (only the view changes)",
+                                     priority=4)
         self.btn_filter.clicked.connect(self._open_filter_popover)
+        # The divider keeps its 4 px of air on each side inside its own box.
+        sep_box = QWidget()
+        sep_lay = QHBoxLayout(sep_box)
+        sep_lay.setContentsMargins(4, 0, 4, 0)
         sep = QFrame()
         sep.setObjectName("Hairline")
         sep.setFixedSize(1, 18)
-        top_layout.addSpacing(4)
-        top_layout.addWidget(sep)
-        top_layout.addSpacing(4)
-        self.btn_sync_agents = top_button("Sync", "Read the connected AI tools again and update the maps")
+        sep_lay.addWidget(sep)
+        sep_box.setFixedWidth(9)
+        self.top_actions.add_separator(sep_box)
+        self.btn_sync_agents = top_button("Sync", "Read the connected AI tools again and update the maps", priority=3)
         self.btn_sync_agents.clicked.connect(self._sync_agent_histories)
-        self.btn_connections = top_button("Integrations", "Choose which AI tools and local models Helios uses", True)
+        self.btn_connections = top_button("Integrations", "Choose which AI tools and local models Helios uses", True, 6)
         self.btn_connections.clicked.connect(self._toggle_connections_page)
-        self.btn_settings = top_button("Settings", "Ollama model, the 'projects/' folder and duplicate merging")
+        self.btn_settings = top_button("Settings", "Ollama model, the 'projects/' folder and duplicate merging",
+                                       priority=5)
         self.btn_settings.clicked.connect(self._open_settings_dialog)
+        top_layout.addWidget(self.top_actions)
 
         # Kept as an attribute for older call sites; the breadcrumb replaces it visually.
         self.btn_view_mode = self.btn_bc_galaxy

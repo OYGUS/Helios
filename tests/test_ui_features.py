@@ -88,6 +88,48 @@ def test_welcome_panel_fits_a_small_window(env):
     assert panel._narrow is True
 
 
+def test_top_bar_buttons_move_into_more_instead_of_widening_the_window(env):
+    """Font-independent: the row's minimum is its "More" button, never all its buttons."""
+    from ui.overflow_row import OverflowRow
+
+    win = _window(env)
+    row = win.top_actions
+    assert row.minimumSizeHint().width() < row.sizeHint().width()
+    assert win.minimumSizeHint().width() <= 1366
+    win.resize(1600, 900)
+    spin(0.05)
+    assert row.anchor_for(win.btn_filter) in (win.btn_filter, row.btn_more)
+
+    holder = QtWidgets.QWidget()
+    lay = QtWidgets.QHBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    bar = OverflowRow(holder)
+    lay.addWidget(bar)
+    clicks = []
+    low = bar.add_button(QtWidgets.QPushButton("Motion"), priority=0)
+    low.setCheckable(True)
+    keep = bar.add_button(QtWidgets.QPushButton("Integrations"), priority=9)
+    keep.clicked.connect(lambda: clicks.append("keep"))
+    holder.resize(bar.sizeHint().width() + 20, 40)
+    holder.show()
+    spin(0.05)
+    assert bar.hidden_buttons() == [] and bar.btn_more.isHidden()
+    holder.resize(bar.btn_more.sizeHint().width() + 4 + keep.sizeHint().width(), 40)
+    spin(0.05)
+    assert bar.hidden_buttons() == [low] and not bar.btn_more.isHidden() and not keep.isHidden()
+    assert bar.anchor_for(low) is bar.btn_more and bar.anchor_for(keep) is keep
+    bar._show_menu()
+    acts = {a.text(): a for a in bar.menu.actions()}
+    assert list(acts) == ["Motion"] and acts["Motion"].isCheckable()
+    acts["Motion"].trigger()
+    assert low.isChecked()
+    bar.menu.hide()
+    holder.resize(bar.sizeHint().width() + 20, 40)
+    spin(0.05)
+    assert bar.hidden_buttons() == [] and bar.btn_more.isHidden()
+    holder.close()
+
+
 def test_project_without_modules_keeps_the_short_hint(env):
     empty = make_system("Blank")
     empty.planets, empty.links = [], []
