@@ -8,7 +8,7 @@ description: Helios Architecture & Knowledge Graph integration. Lets an agent ad
 Use this skill when the user asks you to reflect a project into the **Helios** desktop application. Do not run it after every file change.
 
 ## Core Rules
-1. **Where to run:** from the Helios repository root, or add `--data PATH/to/galaxy.json` before the command. The bridge writes `data/galaxy.json` (or `data/` inside `HELIOS_DATA_DIR` when that is set); the open app reloads it automatically. The `Helios.exe` build keeps its data in `%APPDATA%\Helios\data\galaxy.json`: to update that app from a source checkout, pass `--data "%APPDATA%\Helios\data\galaxy.json"`.
+1. **Where to run:** from the Helios repository root, or add `--data PATH/to/galaxy.json` before the command. The bridge writes `data/galaxy.json` (or `data/` inside `HELIOS_DATA_DIR` when that is set); the open app reloads it automatically. The packaged app (downloaded from a release) keeps its data in a per-user folder: `%APPDATA%\Helios\data\galaxy.json` on Windows, `~/Library/Application Support/Helios/data/galaxy.json` on macOS, `~/.local/share/Helios/data/galaxy.json` on Linux (`$XDG_DATA_HOME/Helios/...` when that is set). To update that app from a source checkout, pass that path with `--data`, for example `--data "%APPDATA%\Helios\data\galaxy.json"`.
 2. **Project Name (`--project`, required):** use the real project name (`Helios`, `MyProject`), never a chat sentence. Alias: `--system`.
 3. **Source (`--source`):** one of `antigravity` (default), `claude_code`, `codebase`, `codex`, `manual`. Pass it explicitly; an invalid value exits with code 2.
 4. **Layer (`--layer`):** one of `architecture`, `ui`, `core` (default), `integration`, `testing`, `research`, `docs`.

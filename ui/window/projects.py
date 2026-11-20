@@ -18,9 +18,6 @@ Of those, assigned by this mixin:
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -46,6 +43,7 @@ from ui.window.ignored_folders import (
     normalize_folder,
     remove_ignored_folder,
 )
+from ui.window.open_path import open_in_file_manager
 from ui.window.remove_project_dialog import RemoveProjectDialog
 from ui.workers import AgentSyncWorker, CodebaseScanWorker
 
@@ -56,10 +54,7 @@ class ProjectActionsMixin:
     def _open_helios_projects_folder(self) -> None:
         p_dir = CodebaseImporter.get_helios_projects_dir()
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(p_dir))
-            else:
-                subprocess.Popen(["xdg-open", str(p_dir)])
+            open_in_file_manager(p_dir)
             self.status_label.setText(f"Opened 'projects/' directory: {p_dir}")
         except Exception as exc:
             QMessageBox.warning(self, "Could not open folder", f"Error: {exc}")
@@ -228,12 +223,7 @@ class ProjectActionsMixin:
                 return
 
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(target_path))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(target_path)])
-            else:
-                subprocess.Popen(["xdg-open", str(target_path)])
+            open_in_file_manager(target_path)
             self.status_label.setText(f"Opened: {target_path}")
         except Exception as exc:
             QMessageBox.warning(self, "Could not open", f"Could not open the location:\n{exc}")

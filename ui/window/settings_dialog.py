@@ -3,9 +3,6 @@ the 'projects/' folder scan, duplicate merging and the ignored-folders list."""
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, Slot
@@ -34,6 +31,7 @@ from core.models import GalaxyStore
 from ui import theme
 from ui.inspector import ElidedLabel, clear_layout
 from ui.window.ignored_folders import ignored_folders, remove_ignored_folder
+from ui.window.open_path import open_in_file_manager
 from ui.window.project_text import AUTO_PURPOSE_SETTING_KEY
 from ui.workers import (
     CodebaseScanWorker,
@@ -401,10 +399,7 @@ class HeliosSettingsDialog(QDialog):
     def _open_helios_projects_folder(self) -> None:
         p_dir = CodebaseImporter.get_helios_projects_dir()
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(p_dir))
-            else:
-                subprocess.Popen(["xdg-open", str(p_dir)])
+            open_in_file_manager(p_dir)
         except Exception as exc:
             QMessageBox.warning(self, "Could not open folder", f"Error: {exc}")
 

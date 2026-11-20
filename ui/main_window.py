@@ -18,6 +18,7 @@ Module map (`ui/window/`; helpers and dialogs never import the mixins):
    * `project_text`          — purpose source labels (`purpose_source_tag`), the weak-evidence tip,
                                the project filter text, `AUTO_PURPOSE_SETTING_KEY`.
    * `ignored_folders`       — the ``ignored_folders`` setting helpers (`folder_is_ignored`, ...).
+   * `open_path`             — `open_in_file_manager` (QDesktopServices; Windows, macOS, Linux).
    * `new_project_dialog`    — `NewProjectStudioDialog`.
    * `integrations`          — `IntegrationCardWidget`, `AIConnectionsView`, `AIConnectionsDialog`.
    * `remove_project_dialog` — `RemoveProjectDialog` (+ `_ChoiceButton`).
@@ -180,6 +181,9 @@ from ui.window.ignored_folders import (  # noqa: F401
     remove_ignored_folder,
     _covering_entries,
     folder_is_ignored,
+)
+from ui.window.open_path import (  # noqa: F401
+    open_in_file_manager,
 )
 from ui.window.new_project_dialog import (  # noqa: F401
     NewProjectStudioDialog,

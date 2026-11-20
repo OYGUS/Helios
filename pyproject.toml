@@ -1,12 +1,16 @@
-# Metadata and tool config only. Helios is run from a repo checkout (python main.py) or as Helios.exe (helios.spec); it is not a pip-installable package.
-# `version` below is the only version number; release tags must match it (v0.1.0).
+# Metadata and tool config only. Helios is run from a repo checkout (python main.py) or as the packaged app built by helios.spec; it is not a pip-installable package.
+# `version` below is the only version number; release tags must match it (v0.2.0).
 [project]
 name = "helios-architecture-graph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Visual architecture studio and interactive knowledge graph for local codebases and AI coding agents."
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["PySide6-Essentials>=6.6.0"]
+dependencies = [
+    # 6.12.0 leaks references to None, which crashes Python < 3.12 (see requirements.txt).
+    'PySide6-Essentials>=6.6.0,!=6.12.0; python_version < "3.12"',
+    'PySide6-Essentials>=6.6.0; python_version >= "3.12"',
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

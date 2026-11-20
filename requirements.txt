@@ -1,1 +1,4 @@
-PySide6-Essentials>=6.6.0
+# PySide6 6.12.0 drops a reference to None on every call that returns nothing; Python 3.10/3.11
+# then crash ("deallocating None") after a few thousand Qt calls. None is immortal from 3.12 on.
+PySide6-Essentials>=6.6.0,!=6.12.0; python_version < "3.12"
+PySide6-Essentials>=6.6.0; python_version >= "3.12"

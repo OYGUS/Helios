@@ -214,6 +214,15 @@ class HistoryMixin:
         self.file_watcher.fileChanged.connect(self._on_external_store_changed)
 
     def _on_external_store_changed(self, path: str) -> None:
+        # Every branch re-arms the watcher: on Linux (inotify) QFileSystemWatcher drops a
+        # path that is replaced by a rename, which is how every save writes galaxy.json
+        # (`atomic_write_text`), so an early return here would lose all later external edits.
+        try:
+            self._reload_external_store()
+        finally:
+            self._rearm_file_watcher()
+
+    def _reload_external_store(self) -> None:
         if self._updating_ui or self._store_busy:
             # A background worker owns the store; the watcher is re-armed when it finishes.
             return
@@ -246,9 +255,3 @@ class HistoryMixin:
             self.status_label.setText("Live update received: Graph synchronized.")
         except Exception as exc:
             self.status_label.setText(f"Live update failed: {exc}")
-        finally:
-            if (
-                self.store.storage_path.exists()
-                and str(self.store.storage_path) not in self.file_watcher.files()
-            ):
-                self.file_watcher.addPath(str(self.store.storage_path))

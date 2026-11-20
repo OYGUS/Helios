@@ -136,6 +136,11 @@ def env(qapp, tmp_path, monkeypatch):
         w.close()
         w.deleteLater()
     spin(0.05)
+    # processEvents() never runs deferred deletes: without this the closed windows stay
+    # alive, and their pending startup timers (e.g. the Ollama model detection 400 ms after
+    # show) fire during a later test, after this fixture's monkeypatches were undone.
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    windows.clear()
     # Never leave an override cursor behind for the next test.
     while QtWidgets.QApplication.overrideCursor() is not None:
         QtWidgets.QApplication.restoreOverrideCursor()
